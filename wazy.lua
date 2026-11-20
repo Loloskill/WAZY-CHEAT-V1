@@ -4,8 +4,12 @@
     (color presets and RGB sliders in SETTINGS > THEME).
     Features: Aimlock (active only while you fire), ESP (line, skeleton, box, name, health, distance), No Recoil, performance system (PERF tab), English / French.
     Menu: floating "V2" button (tap) or RightShift on PC. Language: EN/FR button in the header.
-    Firing is detected from: left mouse button (PC), the equipped Tool's Activated/Deactivated events,
-    and optionally on-screen buttons named in GameConfig.fireButtonNames.
+
+    Firing detection (fires the aimlock on all platforms):
+      - PC: left mouse button.
+      - Mobile (Android/iPhone): any tap that is not swallowed by a UI element inside the lower-right
+        fire zone, PLUS any GuiButton whose Name matches GameConfig.fireButtonNames.
+      - Both: the equipped Tool's Activated/Deactivated events.
 
     STATUS: written without running it. Not tested in Roblox, Delta or any PC executor.
 
@@ -35,10 +39,12 @@ local GameConfig = {
     recoilNamePatterns = { "recoil" },
     -- Names containing these words are left alone (zeroing them could break the game's own math).
     recoilSkipPatterns = { "recover", "decay", "reset", "speed", "time", "delay", "duration", "damp", "stiff" },
-    -- UNKNOWN: on-screen fire button(s) of the game (phones). nil = only the left mouse button and
-    -- Tool.Activated count as firing. To fill it: open Dex, find the fire button under PlayerGui, and put
-    -- a part of its Name here in lowercase, as a list, e.g. { "<part of the button name>" }.
-    fireButtonNames = nil,
+    -- Mobile fire buttons: lowercase name fragments of on-screen fire buttons.
+    -- Scanned under PlayerGui on Android/iOS. Add more if your game uses a different name.
+    fireButtonNames = { "fire", "shoot", "attack", "tire", "tir" },
+    -- Extra touch fallback: any tap on the lower-right quadrant counts as firing on mobile.
+    -- Set to false if that causes accidental aimlock on your game.
+    touchFallback = true,
 }
 
 if GameConfig.gameId ~= nil and game.GameId ~= GameConfig.gameId then
@@ -286,10 +292,12 @@ end
 
 ------------------------------------------------------------------------
 -- Firing detection. Aimlock only works while isFiring() is true.
--- Sources: left mouse button (PC), the equipped Tool's Activated/Deactivated events,
--- and on-screen buttons whose name matches GameConfig.fireButtonNames (optional, UNKNOWN).
+-- Sources: left mouse button (PC), any touch in the lower-right fire zone (mobile),
+-- GuiButtons whose Name matches GameConfig.fireButtonNames, and the equipped Tool's
+-- Activated/Deactivated events.
 ------------------------------------------------------------------------
 local mouseFire = false
+local touchFire = false
 local toolFire = false
 local fireTool = nil
 local toolConns = {}
@@ -313,6 +321,9 @@ local function bindFireTool(tool)
     end
     table.insert(toolConns, tool.Activated:Connect(function()
         toolFire = true
+        task.delay(0.15, function()
+            toolFire = false
+        end)
     end))
     table.insert(toolConns, tool.Deactivated:Connect(function()
         toolFire = false
@@ -322,8 +333,25 @@ local function bindFireTool(tool)
     end))
 end
 
+-- Returns true if the input belongs to the mobile fire zone (lower-right of the screen).
+local function isFireZoneTouch(input)
+    if not GameConfig.touchFallback then
+        return false
+    end
+    local cam = Workspace.CurrentCamera
+    if not cam then
+        return false
+    end
+    local vp = cam.ViewportSize
+    local p = input.Position
+    return p.X > vp.X * 0.5 and p.Y > vp.Y * 0.4
+end
+
 local function watchFireButton(obj)
-    if GameConfig.fireButtonNames == nil or not obj:IsA("GuiButton") then
+    if not obj:IsA("GuiButton") then
+        return
+    end
+    if GameConfig.fireButtonNames == nil then
         return
     end
     if not nameHasAny(obj.Name, GameConfig.fireButtonNames) then
@@ -347,7 +375,7 @@ end
 
 do
     local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
-    if playerGui and GameConfig.fireButtonNames ~= nil then
+    if playerGui then
         for _, d in ipairs(playerGui:GetDescendants()) do
             watchFireButton(d)
         end
@@ -355,13 +383,46 @@ do
     end
 end
 
+-- Raw touch / mouse fallback: any tap that is not consumed by a UI element counts as firing.
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then
+        return
+    end
+    if input.UserInputType == Enum.UserInputType.Touch then
+        if isFireZoneTouch(input) then
+            touchFire = true
+            local c
+            c = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    touchFire = false
+                    c:Disconnect()
+                end
+            end)
+        end
+    elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+        mouseFire = true
+    end
+end))
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        mouseFire = false
+    end
+    if input.UserInputType == Enum.UserInputType.Touch then
+        touchFire = false
+    end
+end))
+track(UserInputService.WindowFocusReleased:Connect(function()
+    mouseFire = false
+    touchFire = false
+end))
+
 local function isFiring()
     local char = LocalPlayer.Character
     local tool = char and char:FindFirstChildOfClass("Tool") or nil
     if tool ~= fireTool then
         bindFireTool(tool)
     end
-    return mouseFire or toolFire or next(buttonInputs) ~= nil
+    return mouseFire or touchFire or toolFire or next(buttonInputs) ~= nil
 end
 
 ------------------------------------------------------------------------
@@ -1721,23 +1782,17 @@ makeDraggable(toggleBtn, toggleBtn, function()
     setMenuVisible(not main.Visible)
 end)
 
+-- PC keyboard shortcut only. Fire-input handling lives in the touch/mouse block above.
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then
+        return
+    end
     if UserInputService:GetFocusedTextBox() then
         return
     end
     if input.KeyCode == Enum.KeyCode.RightShift then
         setMenuVisible(not main.Visible)
-    elseif input.UserInputType == Enum.UserInputType.MouseButton1 and not gameProcessed then
-        mouseFire = true
     end
-end))
-track(UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        mouseFire = false
-    end
-end))
-track(UserInputService.WindowFocusReleased:Connect(function()
-    mouseFire = false
 end))
 
 ------------------------------------------------------------------------
@@ -2146,7 +2201,7 @@ unload = function()
         return
     end
     alive = false
-    mouseFire, toolFire, lockedPlayer = false, false, nil
+    mouseFire, touchFire, toolFire, lockedPlayer = false, false, false, nil
     buttonInputs = {}
     pcall(function()
         RunService:UnbindFromRenderStep("PanelV2Aim")
