@@ -12,8 +12,9 @@
         Fire-zone touches are tracked even when the game consumes the InputBegan (gameProcessed=true),
         so aimlock engages on mobile fire buttons regardless of UI swallowing.
       - Both: the equipped Tool's Activated/Deactivated events.
-    Inputs are tracked by object identity (activeInputs[input]), never by boolean flags, so a
-    swallowed InputEnded can never leave aimlock stuck on a target.
+    Inputs are tracked by object identity (activeInputs[input]). A watchdog clears ALL fire state if
+    no new firing signal arrives for 0.3s, so a swallowed InputEnded can never leave aimlock stuck.
+    lockedPlayer is also released the instant it leaves the FOV circle or the max distance.
 
     STATUS: written without running it. Not tested in Roblox, Delta or any PC executor.
 
@@ -281,16 +282,19 @@ local function findTarget(cam)
 end
 
 ------------------------------------------------------------------------
--- Firing detection. Aimlock only works while isFiring() is true.
--- FIX: track every fire input by object identity in activeInputs[input].
--- A swallowed InputEnded (gameProcessed) can no longer leave aimlock stuck.
--- Fire-zone touches are tracked even when gameProcessed is true on mobile.
--- Tool events stay a third source, with a short decay window for one-shot clicks.
+-- Firing detection.
+-- Source of truth: activeInputs[inputObject]. A watchdog clears it after
+-- FIRE_WATCHDOG seconds with no new signal — a swallowed InputEnded can
+-- never leave aimlock glued to a target.
 ------------------------------------------------------------------------
-local activeInputs = {}   -- [InputObject] = true while held
+local FIRE_WATCHDOG = 0.3
+
+local activeInputs = {}
 local toolFire = false
+local toolFireAt = 0
 local fireTool = nil
 local toolConns = {}
+local lastFireSignal = 0
 
 local function clearToolConns()
     for _, c in ipairs(toolConns) do
@@ -310,8 +314,12 @@ local function bindFireTool(tool)
     end
     table.insert(toolConns, tool.Activated:Connect(function()
         toolFire = true
+        toolFireAt = os.clock()
+        lastFireSignal = os.clock()
         task.delay(0.15, function()
-            toolFire = false
+            if os.clock() - toolFireAt >= 0.15 then
+                toolFire = false
+            end
         end)
     end))
     table.insert(toolConns, tool.Deactivated:Connect(function()
@@ -335,12 +343,12 @@ local function isFireZoneTouch(input)
     return p.X > vp.X * 0.5 and p.Y > vp.Y * 0.4
 end
 
--- Track a fire input by identity. InputEnded always clears it, gameProcessed or not.
 local function trackFireInput(input)
     if activeInputs[input] then
         return
     end
     activeInputs[input] = true
+    lastFireSignal = os.clock()
     local c
     c = input.Changed:Connect(function()
         if input.UserInputState == Enum.UserInputState.End then
@@ -379,9 +387,6 @@ do
     end
 end
 
--- Raw touch / mouse fallback.
--- Fire-zone touches count even when gameProcessed is true — otherwise the game's own
--- fire button (a GuiButton that swallows the tap) never reaches us on mobile.
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if input.UserInputType == Enum.UserInputType.Touch then
         if isFireZoneTouch(input) then
@@ -391,7 +396,6 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
         trackFireInput(input)
     end
 end))
--- Always clear, even when the game swallows the release (gameProcessed=true).
 track(UserInputService.InputEnded:Connect(function(input)
     activeInputs[input] = nil
 end))
@@ -406,12 +410,23 @@ local function isFiring()
     if tool ~= fireTool then
         bindFireTool(tool)
     end
-    return next(activeInputs) ~= nil or toolFire
+    if next(activeInputs) ~= nil then
+        return true
+    end
+    if toolFire and os.clock() - toolFireAt <= 0.15 then
+        return true
+    end
+    -- Watchdog: no new signal for FIRE_WATCHDOG seconds clears any stuck input.
+    if os.clock() - lastFireSignal > FIRE_WATCHDOG then
+        activeInputs = {}
+        toolFire = false
+        return false
+    end
+    return false
 end
 
 ------------------------------------------------------------------------
--- Performance core. perf.level (0-3) is raised automatically when FPS drops (see perfStep) and
--- lowers the cost of ESP and of target searching. It never changes the user's own settings.
+-- Performance core.
 ------------------------------------------------------------------------
 local ADAPT_LEVELS = {
     [0] = { rate = math.huge, players = math.huge, skeleton = true, lines = true, search = 0 },
@@ -424,7 +439,8 @@ local perf = { level = 0, fps = 0, espHz = 0, drawn = 0, frames = 0, espSteps = 
 local perfInfoUpdate = nil
 
 ------------------------------------------------------------------------
--- Aimlock: only while firing. Not firing -> released, target cleared, no residual lock.
+-- Aimlock: only while firing. Not firing -> released. Leaving the FOV
+-- circle or the max distance also releases immediately.
 ------------------------------------------------------------------------
 local lockedPlayer = nil
 local lastSearch = 0
@@ -446,7 +462,16 @@ local function aimStepInner()
     if lockedPlayer then
         local c, p = getTargetParts(lockedPlayer)
         if c and (p.Position - camPos).Magnitude <= S.maxDist then
-            part = p
+            -- Also verify the target is still inside the FOV circle.
+            local vp = cam.ViewportSize
+            local center = Vector2.new(vp.X / 2, vp.Y / 2)
+            local sp, onScreen = cam:WorldToViewportPoint(p.Position)
+            if onScreen and sp.Z > 0
+                and (Vector2.new(sp.X, sp.Y) - center).Magnitude <= S.fov then
+                part = p
+            else
+                lockedPlayer = nil
+            end
         else
             lockedPlayer = nil
         end
