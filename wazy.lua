@@ -5,15 +5,21 @@
     Features: Aimlock (active only while you fire), ESP (line, skeleton, box, name, health, distance), No Recoil, performance system (PERF tab), English / French.
     Menu: floating "V2" button (tap) or RightShift on PC. Language: EN/FR button in the header.
 
-    Firing detection (fires the aimlock on all platforms):
-      - PC: left mouse button.
-      - Mobile (Android/iPhone): any tap that is not swallowed by a UI element inside the lower-right
-        fire zone, PLUS any GuiButton whose Name matches GameConfig.fireButtonNames.
-        Fire-zone touches are tracked even when the game consumes the InputBegan (gameProcessed=true),
-        so aimlock engages on mobile fire buttons regardless of UI swallowing.
-      - Both: the equipped Tool's Activated/Deactivated events.
-    Inputs are tracked by object identity (activeInputs[input]). A watchdog clears ALL fire state if
-    no new firing signal arrives for 0.3s, so a swallowed InputEnded can never leave aimlock stuck.
+    Firing detection (the aimlock acts ONLY while a fire input is physically held):
+      - PC: left mouse button, read from UserInputService:IsMouseButtonPressed every frame
+        (a click on this panel, or on a game GUI while the cursor is free, does not count).
+      - Controller: GameConfig.fireGamepadKeys (default ButtonR2), read with IsGamepadButtonDown every frame.
+      - Mobile (Android/iPhone): a touch that starts inside the lower-right fire zone, is not on this panel,
+        and stays within GameConfig.touchFireMaxDrift pixels of where it began (a camera swipe is not a shot),
+        PLUS any touch that starts on a GuiButton whose Name matches GameConfig.fireButtonNames
+        (that one has no drift limit).
+        Fire-zone touches are tracked even when the game consumes the InputBegan (gameProcessed=true).
+      - All platforms: the equipped Tool's Activated until Deactivated/Unequipped, trusted only while a
+        mouse button, touch or controller fire key is still down.
+    Touches are tracked by object identity and their UserInputState is re-checked every frame, so a swallowed
+    InputEnded can never leave the aimlock stuck on. A touch or tool hold is also capped at FIRE_HOLD_CAP seconds.
+    Window focus loss clears all fire state. A press keeps the lock for at least MIN_FIRE_WINDOW seconds so a
+    one-frame tap still gets an aim step. Not firing means no lock, on every device.
     lockedPlayer is also released the instant it leaves the FOV circle or the max distance.
 
     STATUS: written without running it. Not tested in Roblox, Delta or any PC executor.
@@ -27,6 +33,7 @@ local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
 local Lighting = game:GetService("Lighting")
+local GuiService = game:GetService("GuiService")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -40,6 +47,10 @@ local GameConfig = {
     recoilSkipPatterns = { "recover", "decay", "reset", "speed", "time", "delay", "duration", "damp", "stiff" },
     fireButtonNames = { "fire", "shoot", "attack", "tire", "tir" },
     touchFallback = true,
+    -- Controller fire key. Roblox's default Tool activation is the right trigger; NOT verified for Urban Reload.
+    fireGamepadKeys = { Enum.KeyCode.ButtonR2 },
+    -- Pixels a fire-zone touch may move before it counts as a camera swipe. nil disables the check. Uncalibrated.
+    touchFireMaxDrift = 35,
 }
 
 if GameConfig.gameId ~= nil and game.GameId ~= GameConfig.gameId then
@@ -283,18 +294,64 @@ end
 
 ------------------------------------------------------------------------
 -- Firing detection.
--- Source of truth: activeInputs[inputObject]. A watchdog clears it after
--- FIRE_WATCHDOG seconds with no new signal — a swallowed InputEnded can
--- never leave aimlock glued to a target.
+-- The aimlock may act ONLY while a real fire input is physically held.
+--   Mouse      : IsMouseButtonPressed, polled every frame (ground truth).
+--   Controller : IsGamepadButtonDown for GameConfig.fireGamepadKeys, polled every frame.
+--   Touch      : InputObjects tracked by identity, UserInputState re-checked every frame.
+--   Tool       : Activated until Deactivated/Unequipped, only trusted while a pointer is down.
+-- Presses on this panel's own UI never count as firing.
 ------------------------------------------------------------------------
-local FIRE_WATCHDOG = 0.3
+local MIN_FIRE_WINDOW = 0.1 -- seconds a press keeps the lock at minimum, so a one-frame tap still gets an aim step. 0 disables.
+local FIRE_HOLD_CAP = 15 -- seconds; fail-safe that drops a touch or tool hold that never reported its end.
 
-local activeInputs = {}
-local toolFire = false
-local toolFireAt = 0
+local touches = {} -- [InputObject] = { startPos, since, fire, anchored }
+local toolHeld = false
+local toolSince = 0
 local fireTool = nil
 local toolConns = {}
-local lastFireSignal = 0
+local fireUntil = 0
+local mouseBlocked = false
+local mouseAnchored = false
+local windowFocused = true
+local ownUiObjects = {}
+
+local function registerOwnUi(obj)
+    table.insert(ownUiObjects, obj)
+end
+
+local function pointInGui(obj, x, y)
+    local p, s = obj.AbsolutePosition, obj.AbsoluteSize
+    return x >= p.X and x <= p.X + s.X and y >= p.Y and y <= p.Y + s.Y
+end
+
+-- The panel's ScreenGui ignores the GUI inset while input positions may include it,
+-- so the point is tested both raw and shifted by the inset. A false hit only costs a thin strip.
+local function overOwnUi(pos)
+    local inset = GuiService:GetGuiInset()
+    for _, obj in ipairs(ownUiObjects) do
+        if obj.Parent ~= nil and obj.Visible then
+            if pointInGui(obj, pos.X, pos.Y)
+                or pointInGui(obj, pos.X + inset.X, pos.Y + inset.Y) then
+                return true
+            end
+        end
+    end
+    return false
+end
+
+local function bumpFire()
+    fireUntil = math.max(fireUntil, os.clock() + MIN_FIRE_WINDOW)
+end
+
+local function resetFireState()
+    for input in pairs(touches) do
+        touches[input] = nil
+    end
+    toolHeld = false
+    fireUntil = 0
+    mouseBlocked = false
+    mouseAnchored = false
+end
 
 local function clearToolConns()
     for _, c in ipairs(toolConns) do
@@ -308,25 +365,20 @@ end
 local function bindFireTool(tool)
     clearToolConns()
     fireTool = tool
-    toolFire = false
+    toolHeld = false
     if not tool then
         return
     end
     table.insert(toolConns, tool.Activated:Connect(function()
-        toolFire = true
-        toolFireAt = os.clock()
-        lastFireSignal = os.clock()
-        task.delay(0.15, function()
-            if os.clock() - toolFireAt >= 0.15 then
-                toolFire = false
-            end
-        end)
+        toolHeld = true
+        toolSince = os.clock()
+        bumpFire()
     end))
     table.insert(toolConns, tool.Deactivated:Connect(function()
-        toolFire = false
+        toolHeld = false
     end))
     table.insert(toolConns, tool.Unequipped:Connect(function()
-        toolFire = false
+        toolHeld = false
     end))
 end
 
@@ -343,19 +395,71 @@ local function isFireZoneTouch(input)
     return p.X > vp.X * 0.5 and p.Y > vp.Y * 0.4
 end
 
-local function trackFireInput(input)
-    if activeInputs[input] then
-        return
+-- Every touch is recorded (the tool check needs to know whether any finger is down).
+-- A touch only ever gets upgraded to "fire", never downgraded by a later handler.
+local function registerTouch(input, fire, anchored)
+    local e = touches[input]
+    if not e then
+        e = { startPos = input.Position, since = os.clock(), fire = false, anchored = false }
+        touches[input] = e
     end
-    activeInputs[input] = true
-    lastFireSignal = os.clock()
-    local c
-    c = input.Changed:Connect(function()
-        if input.UserInputState == Enum.UserInputState.End then
-            activeInputs[input] = nil
-            c:Disconnect()
+    if fire then
+        e.fire = true
+        if anchored then
+            e.anchored = true
         end
+        bumpFire()
+    end
+end
+
+local function pruneTouches(now)
+    local limit = GameConfig.touchFireMaxDrift
+    for input, e in pairs(touches) do
+        local state = input.UserInputState
+        if state == Enum.UserInputState.End or state == Enum.UserInputState.Cancel then
+            touches[input] = nil
+        elseif e.fire then
+            if now - e.since > FIRE_HOLD_CAP then
+                e.fire = false
+            elseif limit ~= nil and not e.anchored and (input.Position - e.startPos).Magnitude > limit then
+                e.fire = false
+            end
+        end
+    end
+end
+
+local function isGamepadFireKey(input)
+    local keys = GameConfig.fireGamepadKeys
+    if keys == nil then
+        return false
+    end
+    if not string.find(input.UserInputType.Name, "^Gamepad%d") then
+        return false
+    end
+    for _, key in ipairs(keys) do
+        if input.KeyCode == key then
+            return true
+        end
+    end
+    return false
+end
+
+local function gamepadFireDown()
+    local keys = GameConfig.fireGamepadKeys
+    if keys == nil then
+        return false
+    end
+    local ok, down = pcall(function()
+        for _, pad in ipairs(UserInputService:GetConnectedGamepads()) do
+            for _, key in ipairs(keys) do
+                if UserInputService:IsGamepadButtonDown(pad, key) then
+                    return true
+                end
+            end
+        end
+        return false
     end)
+    return ok and down == true
 end
 
 local function watchFireButton(obj)
@@ -369,11 +473,14 @@ local function watchFireButton(obj)
         return
     end
     track(obj.InputBegan:Connect(function(input)
-        if input.UserInputType ~= Enum.UserInputType.Touch
-            and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
-            return
+        local t = input.UserInputType
+        if t == Enum.UserInputType.Touch then
+            registerTouch(input, true, true)
+        elseif t == Enum.UserInputType.MouseButton1 then
+            mouseAnchored = true
+            mouseBlocked = false
+            bumpFire()
         end
-        trackFireInput(input)
     end))
 end
 
@@ -388,20 +495,36 @@ do
 end
 
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if input.UserInputType == Enum.UserInputType.Touch then
-        if isFireZoneTouch(input) then
-            trackFireInput(input)
+    local t = input.UserInputType
+    if t == Enum.UserInputType.Touch then
+        if overOwnUi(input.Position) then
+            registerTouch(input, false, false)
+        else
+            registerTouch(input, isFireZoneTouch(input), false)
         end
-    elseif input.UserInputType == Enum.UserInputType.MouseButton1 and not gameProcessed then
-        trackFireInput(input)
+    elseif t == Enum.UserInputType.MouseButton1 then
+        if not mouseAnchored then
+            -- With the cursor locked to the center (first person / shift lock) a click can only be a game click.
+            -- With a free cursor, a click on this panel or one the game's GUI consumed is not a shot.
+            local locked = UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter
+            mouseBlocked = (not locked) and (gameProcessed or overOwnUi(UserInputService:GetMouseLocation()))
+        end
+        if not mouseBlocked then
+            bumpFire()
+        end
+    elseif isGamepadFireKey(input) then
+        bumpFire()
     end
 end))
 track(UserInputService.InputEnded:Connect(function(input)
-    activeInputs[input] = nil
+    touches[input] = nil
 end))
 track(UserInputService.WindowFocusReleased:Connect(function()
-    activeInputs = {}
-    toolFire = false
+    windowFocused = false
+    resetFireState()
+end))
+track(UserInputService.WindowFocused:Connect(function()
+    windowFocused = true
 end))
 
 local function isFiring()
@@ -410,19 +533,45 @@ local function isFiring()
     if tool ~= fireTool then
         bindFireTool(tool)
     end
-    if next(activeInputs) ~= nil then
-        return true
-    end
-    if toolFire and os.clock() - toolFireAt <= 0.15 then
-        return true
-    end
-    -- Watchdog: no new signal for FIRE_WATCHDOG seconds clears any stuck input.
-    if os.clock() - lastFireSignal > FIRE_WATCHDOG then
-        activeInputs = {}
-        toolFire = false
+
+    if not windowFocused then
         return false
     end
-    return false
+
+    local now = os.clock()
+    pruneTouches(now)
+
+    local anyTouch = next(touches) ~= nil
+    local mouseDown = UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+    if not mouseDown then
+        mouseBlocked = false
+        mouseAnchored = false
+    end
+    local padDown = gamepadFireDown()
+
+    local held = false
+    if mouseDown and not mouseBlocked then
+        held = true
+    elseif padDown then
+        held = true
+    else
+        for _, e in pairs(touches) do
+            if e.fire then
+                held = true
+                break
+            end
+        end
+    end
+
+    if toolHeld then
+        if now - toolSince > FIRE_HOLD_CAP or not (mouseDown or anyTouch or padDown) then
+            toolHeld = false
+        else
+            held = true
+        end
+    end
+
+    return held or now < fireUntil
 end
 
 ------------------------------------------------------------------------
@@ -1176,6 +1325,7 @@ local main = mk("Frame", {
 }, gui)
 corner(main, 8)
 accentStroke(main, 1.5)
+registerOwnUi(main)
 
 local header = mk("Frame", {
     Size = UDim2.new(1, 0, 0, 38),
@@ -1763,6 +1913,7 @@ circle(toggleBtn)
 bindTheme(toggleBtn, "BackgroundColor3", "accent")
 bindTheme(toggleBtn, "TextColor3", "onAccent")
 stroke(toggleBtn, COLORS.text, 1.5)
+registerOwnUi(toggleBtn)
 makeDraggable(toggleBtn, toggleBtn, function()
     setMenuVisible(not main.Visible)
 end)
@@ -2175,8 +2326,7 @@ unload = function()
         return
     end
     alive = false
-    activeInputs = {}
-    toolFire = false
+    resetFireState()
     lockedPlayer = nil
     pcall(function()
         RunService:UnbindFromRenderStep("PanelV2Aim")
