@@ -1,8 +1,15 @@
---   U[[
- rban Ghost v1 - Roblox Luau mod menu (target game: Urban Reload)
-    Layout: left sidebar tabs (AIM / VISUALS / SETTINGS), switches, sliders, red + black theme.
-    Features: Aimbot, Aimlock, Chams, English / French.
-    Menu: floating red "UG" button (tap) or RightShift on PC. Language: EN/FR button in the header.
+--[[
+    PANEL V2 - Roblox Luau mod menu (target game: Urban Reload)
+    Layout: left sidebar tabs (AIM / ESP / WEAPON / PERF / SETTINGS), switches, sliders, yellow + black theme
+    (color presets and RGB sliders in SETTINGS > THEME).
+    Features: Aimlock (active only while you fire), ESP (line, skeleton, box, name, health, distance), No Recoil, performance system (PERF tab), English / French.
+    Menu: floating "V2" button (tap) or RightShift on PC. Language: EN/FR button in the header.
+
+    Firing detection (fires the aimlock on all platforms):
+      - PC: left mouse button.
+      - Mobile (Android/iPhone): any tap that is not swallowed by a UI element inside the lower-right
+        fire zone, PLUS any GuiButton whose Name matches GameConfig.fireButtonNames.
+      - Both: the equipped Tool's Activated/Deactivated events.
 
     STATUS: written without running it. Not tested in Roblox, Delta or any PC executor.
 
@@ -14,6 +21,7 @@ local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
 local Workspace = game:GetService("Workspace")
+local Lighting = game:GetService("Lighting")
 
 local LocalPlayer = Players.LocalPlayer
 
@@ -27,10 +35,20 @@ local GameConfig = {
     -- Name of a Player attribute that holds the team/crew, if the game uses one instead of Player.Team.
     -- nil = only Roblox's Player.Team is used.
     teamAttribute = nil,
+    -- ASSUMPTION, not verified for Urban Reload: weapon recoil values have names containing these words.
+    recoilNamePatterns = { "recoil" },
+    -- Names containing these words are left alone (zeroing them could break the game's own math).
+    recoilSkipPatterns = { "recover", "decay", "reset", "speed", "time", "delay", "duration", "damp", "stiff" },
+    -- Mobile fire buttons: lowercase name fragments of on-screen fire buttons.
+    -- Scanned under PlayerGui on Android/iOS. Add more if your game uses a different name.
+    fireButtonNames = { "fire", "shoot", "attack", "tire", "tir" },
+    -- Extra touch fallback: any tap on the lower-right quadrant counts as firing on mobile.
+    -- Set to false if that causes accidental aimlock on your game.
+    touchFallback = true,
 }
 
 if GameConfig.gameId ~= nil and game.GameId ~= GameConfig.gameId then
-    warn("[UrbanGhost] Wrong game (GameId " .. tostring(game.GameId) .. "). Not loading.")
+    warn("[PanelV2] Wrong game (GameId " .. tostring(game.GameId) .. "). Not loading.")
     return
 end
 
@@ -47,18 +65,33 @@ end
 ------------------------------------------------------------------------
 local S = {
     lang = "EN",
-    aimbot = false,
     aimlock = false,
-    trigger = "Hold", -- "Hold" (AIM button / right mouse) or "Always"
     part = 1,         -- index into PART_NAMES
     fov = 150,        -- pixel radius around screen center (uncalibrated default)
-    speed = 14,       -- smoothing speed for Aimbot (uncalibrated default)
     maxDist = 500,    -- studs
     teamCheck = true,
     wallCheck = true,
     showFov = true,
-    chams = false,
-    chamsTeamCheck = true,
+    espLine = false,      -- snapline from the top of the screen
+    espSkeleton = false,
+    espBox = false,
+    espName = false,
+    espHealth = false,
+    espDistance = false,
+    espTeamCheck = true,
+    espMaxDist = 1000,    -- studs
+    noRecoil = false,
+    -- performance (all numbers are uncalibrated defaults)
+    adaptive = true,      -- lowers ESP cost automatically when FPS drops
+    targetFps = 30,       -- auto level goes up below 90% of this, back down above 120% of it
+    espRate = 60,         -- maximum ESP refreshes per second
+    espMaxPlayers = 25,   -- draw at most this many players, nearest first
+    gfxQuality = false,
+    gfxShadows = false,
+    gfxMaterials = false,
+    gfxEffects = false,
+    gfxParticles = false,
+    gfxWater = false,
 }
 
 local PART_NAMES = { { "Head" }, { "UpperTorso", "Torso" }, { "HumanoidRootPart" } }
@@ -66,28 +99,56 @@ local PART_KEYS = { "head", "torso", "body" }
 
 local STRINGS = {
     EN = {
-        tab_aim = "AIM", tab_visuals = "VISUALS", tab_settings = "SETTINGS",
-        sec_main = "AIM ASSIST", sec_filters = "FILTERS", sec_esp = "CHAMS", sec_overlay = "OVERLAY",
-        sec_interface = "INTERFACE",
-        aimbot = "Aimbot", aimlock = "Aimlock (sticky)", aimkey = "Activation",
-        hold = "Hold", always = "Always",
+        tab_aim = "AIM", tab_esp = "ESP", tab_weapon = "WEAPON", tab_settings = "SETTINGS",
+        sec_main = "AIM ASSIST", sec_filters = "FILTERS", sec_esp = "PLAYER ESP", sec_overlay = "OVERLAY", sec_weapon = "WEAPON",
+        sec_interface = "INTERFACE", sec_theme = "THEME",
+        aimlock = "Aimlock (sticky)",
         target = "Target", head = "Head", torso = "Torso", body = "Body",
-        fov = "FOV radius", speed = "Aim speed", dist = "Max distance",
+        fov = "FOV radius", dist = "Max distance",
         teamcheck = "Team check", wallcheck = "Wall check", showfov = "Show FOV circle",
-        chams = "Chams", chamsteam = "Chams team check",
-        language = "Language", moveaim = "Move AIM button", unload = "Unload script",
+        esp_line = "Line (from top)", esp_skeleton = "Skeleton", esp_box = "Box", esp_name = "Name",
+        esp_health = "Health", esp_dist = "Distance", esp_team = "ESP team check", esp_maxdist = "ESP range",
+        norecoil = "No Recoil", recoil_off = "No Recoil is off.", recoil_patched = "Patched values:",
+        recoil_none = "Nothing found yet. Equip a weapon. If it stays at 0, the game keeps its recoil somewhere this scan cannot reach.",
+        language = "Language", unload = "Unload script",
+        theme_preset = "Color preset", theme_r = "Red", theme_g = "Green", theme_b = "Blue",
+        theme_reset = "Reset to yellow",
+        pr_yellow = "Yellow", pr_orange = "Orange", pr_red = "Red", pr_green = "Green",
+        pr_blue = "Blue", pr_purple = "Purple", pr_custom = "Custom",
+        tab_perf = "PERF", sec_perf = "SCRIPT PERFORMANCE", sec_gfx = "GRAPHICS BOOSTER",
+        adaptive = "Auto optimize (FPS)", target_fps = "Target FPS",
+        esp_rate = "ESP refresh rate", esp_players = "ESP max players",
+        gfx_quality = "Lowest graphics level", gfx_shadows = "Shadows off", gfx_materials = "Plain materials",
+        gfx_effects = "Post effects off", gfx_particles = "Particles & trails off", gfx_water = "Simple water",
+        gfx_all_on = "Boost everything", gfx_all_off = "Restore graphics",
+        perf_line1 = "FPS: %d   ESP rate: %d Hz   Auto level: %d",
+        perf_line2 = "ESP players drawn: %d   Graphics changes: %d",
     },
     FR = {
-        tab_aim = "VISÉE", tab_visuals = "VISUELS", tab_settings = "RÉGLAGES",
-        sec_main = "AIDE À LA VISÉE", sec_filters = "FILTRES", sec_esp = "CHAMS", sec_overlay = "AFFICHAGE",
-        sec_interface = "INTERFACE",
-        aimbot = "Aimbot", aimlock = "Aimlock (verrou)", aimkey = "Activation",
-        hold = "Maintenir", always = "Toujours",
+        tab_aim = "VISÉE", tab_esp = "ESP", tab_weapon = "ARME", tab_settings = "RÉGLAGES",
+        sec_main = "AIDE À LA VISÉE", sec_filters = "FILTRES", sec_esp = "ESP JOUEURS", sec_overlay = "AFFICHAGE", sec_weapon = "ARME",
+        sec_interface = "INTERFACE", sec_theme = "THÈME",
+        aimlock = "Aimlock (verrou)",
         target = "Cible", head = "Tête", torso = "Torse", body = "Corps",
-        fov = "Rayon FOV", speed = "Vitesse visée", dist = "Distance max",
+        fov = "Rayon FOV", dist = "Distance max",
         teamcheck = "Vérif. équipe", wallcheck = "Vérif. mur", showfov = "Cercle FOV",
-        chams = "Chams", chamsteam = "Chams vérif. équipe",
-        language = "Langue", moveaim = "Déplacer bouton AIM", unload = "Décharger le script",
+        esp_line = "Ligne (du haut)", esp_skeleton = "Squelette", esp_box = "Boîte", esp_name = "Nom",
+        esp_health = "Santé", esp_dist = "Distance", esp_team = "ESP vérif. équipe", esp_maxdist = "Portée ESP",
+        norecoil = "Sans recul", recoil_off = "Sans recul désactivé.", recoil_patched = "Valeurs modifiées :",
+        recoil_none = "Rien trouvé. Équipe une arme. Si ça reste à 0, le jeu garde son recul ailleurs.",
+        language = "Langue", unload = "Décharger le script",
+        theme_preset = "Couleur", theme_r = "Rouge", theme_g = "Vert", theme_b = "Bleu",
+        theme_reset = "Remettre en jaune",
+        pr_yellow = "Jaune", pr_orange = "Orange", pr_red = "Rouge", pr_green = "Vert",
+        pr_blue = "Bleu", pr_purple = "Violet", pr_custom = "Perso",
+        tab_perf = "PERF", sec_perf = "PERFORMANCE SCRIPT", sec_gfx = "BOOST GRAPHIQUE",
+        adaptive = "Optimisation auto (FPS)", target_fps = "FPS cible",
+        esp_rate = "Fréquence ESP", esp_players = "ESP joueurs max",
+        gfx_quality = "Qualité graphique min", gfx_shadows = "Sans ombres", gfx_materials = "Matériaux simples",
+        gfx_effects = "Sans effets post", gfx_particles = "Sans particules", gfx_water = "Eau simple",
+        gfx_all_on = "Tout optimiser", gfx_all_off = "Restaurer graphismes",
+        perf_line1 = "FPS : %d   Fréquence ESP : %d Hz   Niveau auto : %d",
+        perf_line2 = "Joueurs ESP affichés : %d   Changements graphiques : %d",
     },
 }
 
@@ -97,7 +158,7 @@ local function T(key)
 end
 
 ------------------------------------------------------------------------
--- Cleanup bookkeeping
+-- Cleanup bookkeeping and small helpers
 ------------------------------------------------------------------------
 local alive = true
 local conns = {}
@@ -106,7 +167,34 @@ local function track(conn)
     return conn
 end
 
-local aimHeld, rmbHeld, aimUnlocked = false, false, false
+local function nameHasAny(name, patterns)
+    local lower = string.lower(tostring(name))
+    for _, pat in ipairs(patterns) do
+        if string.find(lower, pat, 1, true) then
+            return true
+        end
+    end
+    return false
+end
+
+-- Cached player list: avoids a new table from Players:GetPlayers() every frame.
+local playerList = Players:GetPlayers()
+track(Players.PlayerAdded:Connect(function(p)
+    for _, q in ipairs(playerList) do
+        if q == p then
+            return
+        end
+    end
+    table.insert(playerList, p)
+end))
+track(Players.PlayerRemoving:Connect(function(p)
+    for i = #playerList, 1, -1 do
+        if playerList[i] == p then
+            table.remove(playerList, i)
+            break
+        end
+    end
+end))
 
 ------------------------------------------------------------------------
 -- Targeting (pure game-side logic, no UI)
@@ -170,13 +258,12 @@ local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.RespectCanCollide = true
 
+local ignoreList = { false, false } -- both slots are overwritten before every use (no new table per raycast)
+
 local function isVisible(origin, part, targetChar)
-    local ignore = {}
-    if LocalPlayer.Character then
-        table.insert(ignore, LocalPlayer.Character)
-    end
-    table.insert(ignore, targetChar)
-    rayParams.FilterDescendantsInstances = ignore
+    ignoreList[1] = LocalPlayer.Character or targetChar
+    ignoreList[2] = targetChar
+    rayParams.FilterDescendantsInstances = ignoreList
     return Workspace:Raycast(origin, part.Position - origin, rayParams) == nil
 end
 
@@ -186,7 +273,7 @@ local function findTarget(cam)
     local center = Vector2.new(vp.X / 2, vp.Y / 2)
     local camPos = cam.CFrame.Position
     local best, bestDist = nil, S.fov
-    for _, plr in ipairs(Players:GetPlayers()) do
+    for _, plr in ipairs(playerList) do
         local char, part = getTargetParts(plr)
         if char then
             if (part.Position - camPos).Magnitude <= S.maxDist then
@@ -203,15 +290,170 @@ local function findTarget(cam)
     return best
 end
 
-local lockedPlayer = nil
+------------------------------------------------------------------------
+-- Firing detection. Aimlock only works while isFiring() is true.
+-- Sources: left mouse button (PC), any touch in the lower-right fire zone (mobile),
+-- GuiButtons whose Name matches GameConfig.fireButtonNames, and the equipped Tool's
+-- Activated/Deactivated events.
+------------------------------------------------------------------------
+local mouseFire = false
+local touchFire = false
+local toolFire = false
+local fireTool = nil
+local toolConns = {}
+local buttonInputs = {} -- inputs currently held on a fire button
 
-local function aimStepInner(dt)
+local function clearToolConns()
+    for _, c in ipairs(toolConns) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+    toolConns = {}
+end
+
+local function bindFireTool(tool)
+    clearToolConns()
+    fireTool = tool
+    toolFire = false
+    if not tool then
+        return
+    end
+    table.insert(toolConns, tool.Activated:Connect(function()
+        toolFire = true
+        task.delay(0.15, function()
+            toolFire = false
+        end)
+    end))
+    table.insert(toolConns, tool.Deactivated:Connect(function()
+        toolFire = false
+    end))
+    table.insert(toolConns, tool.Unequipped:Connect(function()
+        toolFire = false
+    end))
+end
+
+-- Returns true if the input belongs to the mobile fire zone (lower-right of the screen).
+local function isFireZoneTouch(input)
+    if not GameConfig.touchFallback then
+        return false
+    end
+    local cam = Workspace.CurrentCamera
+    if not cam then
+        return false
+    end
+    local vp = cam.ViewportSize
+    local p = input.Position
+    return p.X > vp.X * 0.5 and p.Y > vp.Y * 0.4
+end
+
+local function watchFireButton(obj)
+    if not obj:IsA("GuiButton") then
+        return
+    end
+    if GameConfig.fireButtonNames == nil then
+        return
+    end
+    if not nameHasAny(obj.Name, GameConfig.fireButtonNames) then
+        return
+    end
+    track(obj.InputBegan:Connect(function(input)
+        if input.UserInputType ~= Enum.UserInputType.Touch
+            and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+            return
+        end
+        buttonInputs[input] = true
+        local c
+        c = input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                buttonInputs[input] = nil
+                c:Disconnect()
+            end
+        end)
+    end))
+end
+
+do
+    local playerGui = LocalPlayer:FindFirstChildOfClass("PlayerGui")
+    if playerGui then
+        for _, d in ipairs(playerGui:GetDescendants()) do
+            watchFireButton(d)
+        end
+        track(playerGui.DescendantAdded:Connect(watchFireButton))
+    end
+end
+
+-- Raw touch / mouse fallback: any tap that is not consumed by a UI element counts as firing.
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then
+        return
+    end
+    if input.UserInputType == Enum.UserInputType.Touch then
+        if isFireZoneTouch(input) then
+            touchFire = true
+            local c
+            c = input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then
+                    touchFire = false
+                    c:Disconnect()
+                end
+            end)
+        end
+    elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
+        mouseFire = true
+    end
+end))
+track(UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 then
+        mouseFire = false
+    end
+    if input.UserInputType == Enum.UserInputType.Touch then
+        touchFire = false
+    end
+end))
+track(UserInputService.WindowFocusReleased:Connect(function()
+    mouseFire = false
+    touchFire = false
+end))
+
+local function isFiring()
+    local char = LocalPlayer.Character
+    local tool = char and char:FindFirstChildOfClass("Tool") or nil
+    if tool ~= fireTool then
+        bindFireTool(tool)
+    end
+    return mouseFire or touchFire or toolFire or next(buttonInputs) ~= nil
+end
+
+------------------------------------------------------------------------
+-- Performance core. perf.level (0-3) is raised automatically when FPS drops (see perfStep) and
+-- lowers the cost of ESP and of target searching. It never changes the user's own settings.
+-- The values in ADAPT_LEVELS are uncalibrated defaults.
+------------------------------------------------------------------------
+local ADAPT_LEVELS = {
+    [0] = { rate = math.huge, players = math.huge, skeleton = true, lines = true, search = 0 },
+    [1] = { rate = 40, players = math.huge, skeleton = true, lines = true, search = 0.05 },
+    [2] = { rate = 30, players = 15, skeleton = false, lines = true, search = 0.05 },
+    [3] = { rate = 20, players = 10, skeleton = false, lines = false, search = 0.08 },
+}
+
+local perf = { level = 0, fps = 0, espHz = 0, drawn = 0, frames = 0, espSteps = 0, acc = 0, good = 0, bad = 0 }
+local perfInfoUpdate = nil
+
+------------------------------------------------------------------------
+-- Aimlock: while firing, locks the camera on the closest valid target in the FOV circle and
+-- keeps that same target until it becomes invalid or you stop firing.
+------------------------------------------------------------------------
+local lockedPlayer = nil
+local lastSearch = 0
+
+local function aimStepInner()
     local cam = Workspace.CurrentCamera
     if not cam then
         return
     end
-    local active = S.trigger == "Always" or aimHeld or rmbHeld
-    if not (S.aimbot or S.aimlock) or not active then
+    local firing = isFiring()
+    if not S.aimlock or not firing then
         lockedPlayer = nil
         return
     end
@@ -219,28 +461,24 @@ local function aimStepInner(dt)
     local camPos = cam.CFrame.Position
     local part = nil
 
-    if S.aimlock then
-        if lockedPlayer then
-            local c, p = getTargetParts(lockedPlayer)
-            if c and (p.Position - camPos).Magnitude <= S.maxDist then
-                part = p
-            else
-                lockedPlayer = nil
-            end
+    if lockedPlayer then
+        local c, p = getTargetParts(lockedPlayer)
+        if c and (p.Position - camPos).Magnitude <= S.maxDist then
+            part = p
+        else
+            lockedPlayer = nil
         end
-        if not part then
+    end
+    if not part then
+        -- at auto level 0 the search runs every frame; higher levels space the searches out
+        local now = os.clock()
+        if now - lastSearch >= ADAPT_LEVELS[perf.level].search then
+            lastSearch = now
             lockedPlayer = findTarget(cam)
             if lockedPlayer then
                 local _, p = getTargetParts(lockedPlayer)
                 part = p
             end
-        end
-    else
-        lockedPlayer = nil
-        local plr = findTarget(cam)
-        if plr then
-            local _, p = getTargetParts(plr)
-            part = p
         end
     end
 
@@ -248,32 +486,546 @@ local function aimStepInner(dt)
         return
     end
 
-    local goal = CFrame.lookAt(camPos, part.Position)
-    local alpha = S.aimlock and 1 or (1 - math.exp(-S.speed * dt))
-    cam.CFrame = cam.CFrame:Lerp(goal, alpha)
+    cam.CFrame = CFrame.lookAt(camPos, part.Position)
 end
 
 local aimErrorShown = false
-local function aimStep(dt)
-    local ok, err = pcall(aimStepInner, dt)
+local function aimStep()
+    local ok, err = pcall(aimStepInner)
     if not ok and not aimErrorShown then
         aimErrorShown = true
-        warn("[UrbanGhost] aim error: " .. tostring(err))
+        warn("[PanelV2] aim error: " .. tostring(err))
     end
 end
 
 ------------------------------------------------------------------------
--- UI helpers
+-- No Recoil: sets recoil-named values on the player's weapons to zero (Attributes, Value
+-- objects, and tables returned by ModuleScripts inside the Tool). Original values are saved
+-- and restored when the switch is turned off or the script is unloaded.
+-- Whether Urban Reload stores recoil this way is UNKNOWN. The menu shows how many values
+-- were patched, so you can see at once whether anything was found.
+------------------------------------------------------------------------
+local recoilList = {}
+local recoilSeen = setmetatable({}, { __mode = "k" })
+local recoilNotified = 0
+local onRecoilChanged = nil
+
+local function isRecoilName(name)
+    return nameHasAny(name, GameConfig.recoilNamePatterns)
+        and not nameHasAny(name, GameConfig.recoilSkipPatterns)
+end
+
+local function zeroOf(value)
+    local t = typeof(value)
+    if t == "number" then
+        return 0
+    elseif t == "Vector3" then
+        return Vector3.zero
+    elseif t == "Vector2" then
+        return Vector2.zero
+    end
+    return nil
+end
+
+local function writeEntry(e, value)
+    pcall(function()
+        if e.kind == "attr" then
+            e.target:SetAttribute(e.key, value)
+        elseif e.kind == "value" then
+            e.target.Value = value
+        else
+            e.target[e.key] = value
+        end
+    end)
+end
+
+local function readEntry(e)
+    local ok, v = pcall(function()
+        if e.kind == "attr" then
+            return e.target:GetAttribute(e.key)
+        elseif e.kind == "value" then
+            return e.target.Value
+        end
+        return e.target[e.key]
+    end)
+    if ok then
+        return v
+    end
+    return nil
+end
+
+local function patchValue(kind, owner, target, key, current)
+    local zero = zeroOf(current)
+    if zero == nil or current == zero then
+        return
+    end
+    local seen = recoilSeen[target]
+    if not seen then
+        seen = {}
+        recoilSeen[target] = seen
+    end
+    if seen[key] then
+        return
+    end
+    seen[key] = true
+    local entry = { kind = kind, owner = owner, target = target, key = key, original = current, zero = zero }
+    table.insert(recoilList, entry)
+    writeEntry(entry, zero)
+end
+
+local function patchTable(tbl, owner, depth, visited)
+    if depth > 3 or visited[tbl] then
+        return
+    end
+    visited[tbl] = true
+    pcall(function()
+        for k, v in pairs(tbl) do
+            if type(v) == "table" then
+                patchTable(v, owner, depth + 1, visited)
+            elseif type(k) == "string" and isRecoilName(k) then
+                patchValue("table", owner, tbl, k, v)
+            end
+        end
+    end)
+end
+
+local function scanInstance(root)
+    local list = root:GetDescendants()
+    table.insert(list, 1, root)
+    for _, inst in ipairs(list) do
+        for name, val in pairs(inst:GetAttributes()) do
+            if isRecoilName(name) then
+                patchValue("attr", inst, inst, name, val)
+            end
+        end
+        if (inst:IsA("NumberValue") or inst:IsA("IntValue") or inst:IsA("Vector3Value"))
+            and isRecoilName(inst.Name) then
+            patchValue("value", inst, inst, "Value", inst.Value)
+        end
+        if inst:IsA("ModuleScript") then
+            local ok, result = pcall(require, inst)
+            if ok and type(result) == "table" then
+                patchTable(result, inst, 0, {})
+            end
+        end
+    end
+end
+
+local function scanRecoil()
+    for i = #recoilList, 1, -1 do
+        if not recoilList[i].owner:IsDescendantOf(game) then
+            table.remove(recoilList, i)
+        end
+    end
+    for _, e in ipairs(recoilList) do
+        if readEntry(e) ~= e.zero then
+            writeEntry(e, e.zero)
+        end
+    end
+
+    local tools = {}
+    local char = LocalPlayer.Character
+    if char then
+        for _, c in ipairs(char:GetChildren()) do
+            if c:IsA("Tool") then
+                table.insert(tools, c)
+            end
+        end
+    end
+    local backpack = LocalPlayer:FindFirstChildOfClass("Backpack")
+    if backpack then
+        for _, c in ipairs(backpack:GetChildren()) do
+            if c:IsA("Tool") then
+                table.insert(tools, c)
+            end
+        end
+    end
+    for _, tool in ipairs(tools) do
+        scanInstance(tool)
+    end
+
+    if #recoilList ~= recoilNotified then
+        recoilNotified = #recoilList
+        if onRecoilChanged then
+            onRecoilChanged()
+        end
+    end
+end
+
+local function restoreRecoil()
+    for _, e in ipairs(recoilList) do
+        writeEntry(e, e.original)
+    end
+    recoilList = {}
+    for k in pairs(recoilSeen) do
+        recoilSeen[k] = nil
+    end
+    recoilNotified = 0
+    if onRecoilChanged then
+        onRecoilChanged()
+    end
+end
+
+------------------------------------------------------------------------
+-- Graphics booster. Every feature saves the original values and restores them when switched
+-- off or when the script is unloaded. Big scans are spread over many frames (GFX_BUDGET seconds
+-- per frame) so the game does not freeze. Whether each setting takes effect on your device and
+-- executor is UNKNOWN: the PERF tab shows how many changes were really made.
+------------------------------------------------------------------------
+local GFX_BUDGET = 0.003 -- seconds of work per frame (uncalibrated)
+local GFX_ORDER = { "quality", "shadows", "materials", "effects", "particles", "water" }
+local GFX_INSTANCE_FEATURES = { "shadows", "materials", "effects", "particles" }
+local GFX_FLAG = {
+    quality = "gfxQuality", shadows = "gfxShadows", materials = "gfxMaterials",
+    effects = "gfxEffects", particles = "gfxParticles", water = "gfxWater",
+}
+
+local function weakKeys()
+    return setmetatable({}, { __mode = "k" })
+end
+
+local P_SHADOW = { CastShadow = false }
+local P_MATERIAL = { Material = Enum.Material.Plastic, Reflectance = 0 }
+local P_DISABLE = { Enabled = false }
+-- ColorCorrectionEffect is left alone on purpose so the picture keeps its colors.
+local EFFECT_CLASSES = { BloomEffect = true, BlurEffect = true, SunRaysEffect = true, DepthOfFieldEffect = true }
+local PARTICLE_CLASSES = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
+
+-- Each matcher returns the (shared, constant) table of properties to set on that instance, or nil.
+local GFX_MATCH = {
+    shadows = function(inst)
+        if inst:IsA("BasePart") and not inst:IsA("Terrain") then
+            return P_SHADOW
+        end
+        return nil
+    end,
+    materials = function(inst)
+        if inst:IsA("BasePart") and not inst:IsA("Terrain") then
+            return P_MATERIAL
+        end
+        return nil
+    end,
+    effects = function(inst)
+        if EFFECT_CLASSES[inst.ClassName] then
+            return P_DISABLE
+        end
+        return nil
+    end,
+    particles = function(inst)
+        if PARTICLE_CLASSES[inst.ClassName] then
+            return P_DISABLE
+        end
+        return nil
+    end,
+}
+
+-- GFX_ORIG[feature][property][instance] = original value (only stored when it differs from the target)
+local GFX_ORIG = {
+    shadows = { CastShadow = weakKeys() },
+    materials = { Material = weakKeys(), Reflectance = weakKeys() },
+    effects = { Enabled = weakKeys() },
+    particles = { Enabled = weakKeys() },
+}
+
+local gfxGen = { shadows = 0, materials = 0, effects = 0, particles = 0 }
+local gfxJobs = {}
+local gfxChanged = 0
+local gfxGlobal = {} -- original values of the global settings (quality, shadows, water)
+local gfxHooks = {}
+local onGfxChanged = nil
+
+local function gfxApplyProps(orig, props, inst)
+    for prop, target in pairs(props) do
+        local cur = inst[prop]
+        if cur ~= target then
+            local store = orig[prop]
+            if store[inst] == nil then
+                store[inst] = cur
+                gfxChanged += 1
+            end
+            inst[prop] = target
+        end
+    end
+end
+
+local function gfxSetProp(inst, prop, value)
+    inst[prop] = value
+end
+
+local function gfxOnAdded(inst)
+    for _, f in ipairs(GFX_INSTANCE_FEATURES) do
+        if S[GFX_FLAG[f]] then
+            local props = GFX_MATCH[f](inst)
+            if props then
+                pcall(gfxApplyProps, GFX_ORIG[f], props, inst)
+            end
+        end
+    end
+end
+
+-- New instances (effects, debris, characters) are handled as they appear, only while a feature is on.
+local function gfxUpdateHooks()
+    local any = false
+    for _, f in ipairs(GFX_INSTANCE_FEATURES) do
+        if S[GFX_FLAG[f]] then
+            any = true
+        end
+    end
+    if any and #gfxHooks == 0 then
+        gfxHooks[1] = Workspace.DescendantAdded:Connect(gfxOnAdded)
+        gfxHooks[2] = Lighting.DescendantAdded:Connect(gfxOnAdded)
+    elseif not any and #gfxHooks > 0 then
+        for _, c in ipairs(gfxHooks) do
+            pcall(function()
+                c:Disconnect()
+            end)
+        end
+        gfxHooks = {}
+    end
+end
+
+local function gfxQueueApply(feature)
+    local list = Workspace:GetDescendants()
+    if feature == "effects" or feature == "particles" then
+        for _, d in ipairs(Lighting:GetDescendants()) do
+            table.insert(list, d)
+        end
+    end
+    table.insert(gfxJobs, { kind = "apply", feature = feature, gen = gfxGen[feature], list = list, i = 1 })
+end
+
+local function gfxQueueRestore(feature)
+    local insts, props, vals, n = {}, {}, {}, 0
+    for prop, store in pairs(GFX_ORIG[feature]) do
+        for inst, value in pairs(store) do
+            n += 1
+            insts[n], props[n], vals[n] = inst, prop, value
+            store[inst] = nil
+        end
+    end
+    gfxChanged = math.max(0, gfxChanged - n)
+    if n > 0 then
+        table.insert(gfxJobs, { kind = "restore", list = insts, props = props, vals = vals, i = 1 })
+    end
+end
+
+local function gfxPump()
+    local job = gfxJobs[1]
+    if not job then
+        return
+    end
+    local t0 = os.clock()
+    local list = job.list
+    local n = #list
+    local i = job.i
+    if job.kind == "apply" then
+        if job.gen ~= gfxGen[job.feature] or not S[GFX_FLAG[job.feature]] then
+            table.remove(gfxJobs, 1)
+            return
+        end
+        local match, orig = GFX_MATCH[job.feature], GFX_ORIG[job.feature]
+        while i <= n do
+            local inst = list[i]
+            i += 1
+            local props = match(inst)
+            if props then
+                pcall(gfxApplyProps, orig, props, inst)
+            end
+            if i % 128 == 0 and os.clock() - t0 > GFX_BUDGET then
+                break
+            end
+        end
+    else
+        local props, vals = job.props, job.vals
+        while i <= n do
+            local inst = list[i]
+            if inst.Parent ~= nil then
+                pcall(gfxSetProp, inst, props[i], vals[i])
+            end
+            i += 1
+            if i % 128 == 0 and os.clock() - t0 > GFX_BUDGET then
+                break
+            end
+        end
+    end
+    job.i = i
+    if i > n then
+        table.remove(gfxJobs, 1)
+        if onGfxChanged then
+            onGfxChanged()
+        end
+    end
+end
+track(RunService.Heartbeat:Connect(gfxPump))
+
+-- Global settings (not per instance). The shadows feature also switches off Lighting.GlobalShadows.
+local function gfxApplyGlobal(feature)
+    if feature == "quality" then
+        if gfxGlobal.quality == nil then
+            local ok = pcall(function()
+                local r = settings().Rendering
+                gfxGlobal.quality = r.QualityLevel
+                r.QualityLevel = Enum.QualityLevel.Level01
+            end)
+            if ok then
+                gfxChanged += 1
+            else
+                gfxGlobal.quality = nil
+            end
+        end
+    elseif feature == "water" then
+        local terrain = Workspace:FindFirstChildOfClass("Terrain")
+        if terrain and gfxGlobal.water == nil then
+            local ok = pcall(function()
+                gfxGlobal.water = { terrain.WaterWaveSize, terrain.WaterWaveSpeed, terrain.WaterReflectance }
+                terrain.WaterWaveSize = 0
+                terrain.WaterWaveSpeed = 0
+                terrain.WaterReflectance = 0
+            end)
+            if ok then
+                gfxChanged += 1
+            else
+                gfxGlobal.water = nil
+            end
+        end
+    elseif feature == "shadows" then
+        if gfxGlobal.shadows == nil then
+            local ok = pcall(function()
+                gfxGlobal.shadows = Lighting.GlobalShadows
+                Lighting.GlobalShadows = false
+            end)
+            if ok then
+                gfxChanged += 1
+            else
+                gfxGlobal.shadows = nil
+            end
+        end
+    end
+end
+
+local function gfxRestoreGlobal(feature)
+    if feature == "quality" and gfxGlobal.quality ~= nil then
+        pcall(function()
+            settings().Rendering.QualityLevel = gfxGlobal.quality
+        end)
+        gfxGlobal.quality = nil
+        gfxChanged = math.max(0, gfxChanged - 1)
+    elseif feature == "water" and gfxGlobal.water ~= nil then
+        local w = gfxGlobal.water
+        local terrain = Workspace:FindFirstChildOfClass("Terrain")
+        if terrain then
+            pcall(function()
+                terrain.WaterWaveSize = w[1]
+                terrain.WaterWaveSpeed = w[2]
+                terrain.WaterReflectance = w[3]
+            end)
+        end
+        gfxGlobal.water = nil
+        gfxChanged = math.max(0, gfxChanged - 1)
+    elseif feature == "shadows" and gfxGlobal.shadows ~= nil then
+        local value = gfxGlobal.shadows
+        pcall(function()
+            Lighting.GlobalShadows = value
+        end)
+        gfxGlobal.shadows = nil
+        gfxChanged = math.max(0, gfxChanged - 1)
+    end
+end
+
+-- The caller sets S.<flag> first, then calls this.
+local function gfxSet(feature, on)
+    local perInstance = gfxGen[feature] ~= nil
+    if perInstance then
+        gfxGen[feature] += 1
+    end
+    if on then
+        gfxApplyGlobal(feature)
+        if perInstance then
+            gfxQueueApply(feature)
+        end
+    else
+        gfxRestoreGlobal(feature)
+        if perInstance then
+            gfxQueueRestore(feature)
+        end
+    end
+    gfxUpdateHooks()
+    if onGfxChanged then
+        onGfxChanged()
+    end
+end
+
+-- Unload: drop pending scans, finish pending restores at once, restore everything.
+local function gfxShutdown()
+    for _, c in ipairs(gfxHooks) do
+        pcall(function()
+            c:Disconnect()
+        end)
+    end
+    gfxHooks = {}
+    for i = #gfxJobs, 1, -1 do
+        if gfxJobs[i].kind == "apply" then
+            table.remove(gfxJobs, i)
+        end
+    end
+    for _, f in ipairs(GFX_INSTANCE_FEATURES) do
+        gfxQueueRestore(f)
+    end
+    for _, job in ipairs(gfxJobs) do
+        for i = job.i, #job.list do
+            local inst = job.list[i]
+            if inst.Parent ~= nil then
+                pcall(gfxSetProp, inst, job.props[i], job.vals[i])
+            end
+        end
+    end
+    gfxJobs = {}
+    for _, f in ipairs(GFX_ORDER) do
+        gfxRestoreGlobal(f)
+    end
+    gfxChanged = 0
+end
+
+------------------------------------------------------------------------
+-- UI helpers and theme
 ------------------------------------------------------------------------
 local COLORS = {
     bg = Color3.fromRGB(14, 14, 16),
     panel = Color3.fromRGB(20, 20, 24),
     row = Color3.fromRGB(30, 30, 35),
-    red = Color3.fromRGB(210, 32, 44),
     off = Color3.fromRGB(62, 62, 70),
     text = Color3.fromRGB(235, 235, 238),
-    amber = Color3.fromRGB(230, 170, 30),
+    dim = Color3.fromRGB(150, 150, 156),
 }
+
+local PRESETS = {
+    { key = "pr_yellow", color = Color3.fromRGB(255, 204, 0) },
+    { key = "pr_orange", color = Color3.fromRGB(255, 128, 0) },
+    { key = "pr_red", color = Color3.fromRGB(210, 32, 44) },
+    { key = "pr_green", color = Color3.fromRGB(46, 204, 90) },
+    { key = "pr_blue", color = Color3.fromRGB(52, 152, 255) },
+    { key = "pr_purple", color = Color3.fromRGB(160, 90, 255) },
+}
+local DEFAULT_ACCENT = PRESETS[1].color -- change PRESETS[1] to change the startup color
+
+local theme = { accent = DEFAULT_ACCENT }
+local themed = {} -- { inst, prop, kind } where kind is "accent" or "onAccent"
+
+local function channel(c, k)
+    return math.floor(c[k] * 255 + 0.5)
+end
+
+-- Text color that stays readable on top of the accent color.
+local function onAccentColor(c)
+    local lum = 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
+    return (lum > 0.55) and COLORS.bg or COLORS.text
+end
+
+local function bindTheme(inst, prop, kind)
+    table.insert(themed, { inst = inst, prop = prop, kind = kind })
+    inst[prop] = (kind == "accent") and theme.accent or onAccentColor(theme.accent)
+    return inst
+end
 
 local function mk(class, props, parent)
     local inst = Instance.new(class)
@@ -294,6 +1046,10 @@ end
 
 local function stroke(inst, color, thickness)
     return mk("UIStroke", { Color = color, Thickness = thickness, ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, inst)
+end
+
+local function accentStroke(inst, thickness)
+    return bindTheme(stroke(inst, theme.accent, thickness), "Color", "accent")
 end
 
 local function isPointerBegin(input)
@@ -323,14 +1079,27 @@ end
 local guiParent = getGuiParent()
 
 local gui = mk("ScreenGui", {
-    Name = "UrbanGhost",
+    Name = "PanelV2",
     ResetOnSpawn = false,
     IgnoreGuiInset = true,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
     DisplayOrder = 100,
 }, guiParent)
 
-local chamsFolder = mk("Folder", { Name = "UrbanGhostChams" }, guiParent)
+-- ESP lives in its own ScreenGui below the menu (lower DisplayOrder).
+local espGui = mk("ScreenGui", {
+    Name = "PanelV2Esp",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = true,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+    DisplayOrder = 50,
+}, guiParent)
+local espLayer = mk("Frame", {
+    Size = UDim2.new(1, 0, 1, 0),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    Active = false,
+}, espGui)
 
 local function makeDraggable(handle, target, onTap, canDrag)
     local dragging, dragInput, dragStart, startPos, moved = false, nil, nil, nil, false
@@ -374,7 +1143,7 @@ local function makeDraggable(handle, target, onTap, canDrag)
 end
 
 ------------------------------------------------------------------------
--- FOV circle and AIM button
+-- FOV circle
 ------------------------------------------------------------------------
 local fovCircle = mk("Frame", {
     Name = "FovCircle",
@@ -386,39 +1155,8 @@ local fovCircle = mk("Frame", {
     Visible = false,
 }, gui)
 circle(fovCircle)
-stroke(fovCircle, COLORS.red, 1.5)
+accentStroke(fovCircle, 1.5)
 
-local aimBtn = mk("TextButton", {
-    Name = "AimButton",
-    Size = UDim2.fromOffset(72, 72),
-    Position = UDim2.new(1, -110, 1, -190),
-    BackgroundColor3 = COLORS.red,
-    BackgroundTransparency = 0.15,
-    Text = "AIM",
-    Font = Enum.Font.GothamBold,
-    TextSize = 18,
-    TextColor3 = COLORS.text,
-    AutoButtonColor = false,
-    Visible = false,
-}, gui)
-circle(aimBtn)
-stroke(aimBtn, COLORS.text, 1.5)
-
-aimBtn.InputBegan:Connect(function(input)
-    if isPointerBegin(input) and not aimUnlocked then
-        aimHeld = true
-        local c
-        c = input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                aimHeld = false
-                c:Disconnect()
-            end
-        end)
-    end
-end)
-makeDraggable(aimBtn, aimBtn, nil, function()
-    return aimUnlocked
-end)
 
 ------------------------------------------------------------------------
 -- Localisation refresh registry
@@ -437,6 +1175,8 @@ end
 ------------------------------------------------------------------------
 -- Main window: header, sidebar, pages
 ------------------------------------------------------------------------
+local applyTheme -- assigned below, after all UI exists
+
 local main = mk("Frame", {
     Name = "Main",
     Size = UDim2.fromOffset(460, 290),
@@ -446,7 +1186,7 @@ local main = mk("Frame", {
     Active = true,
 }, gui)
 corner(main, 8)
-stroke(main, COLORS.red, 1.5)
+accentStroke(main, 1.5)
 
 local header = mk("Frame", {
     Size = UDim2.new(1, 0, 0, 38),
@@ -454,14 +1194,14 @@ local header = mk("Frame", {
     BorderSizePixel = 0,
 }, main)
 corner(header, 8)
-mk("Frame", {
+local headerLine = mk("Frame", {
     Size = UDim2.new(1, 0, 0, 2),
     Position = UDim2.new(0, 0, 0, 38),
-    BackgroundColor3 = COLORS.red,
     BorderSizePixel = 0,
 }, main)
+bindTheme(headerLine, "BackgroundColor3", "accent")
 
-mk("TextLabel", {
+local titleLabel = mk("TextLabel", {
     BackgroundTransparency = 1,
     Position = UDim2.new(0, 14, 0, 0),
     Size = UDim2.new(1, -120, 1, 0),
@@ -470,8 +1210,16 @@ mk("TextLabel", {
     TextColor3 = COLORS.text,
     TextXAlignment = Enum.TextXAlignment.Left,
     RichText = true,
-    Text = 'URBAN GHOST <font color="#D2202C">v1</font>',
+    Text = "",
 }, header)
+
+local function hexOf(c)
+    return string.format("%02X%02X%02X", channel(c, "R"), channel(c, "G"), channel(c, "B"))
+end
+local function updateTitle()
+    titleLabel.Text = 'PANEL <font color="#' .. hexOf(theme.accent) .. '">V2</font>'
+end
+updateTitle()
 
 local langBtn = mk("TextButton", {
     Size = UDim2.fromOffset(40, 24),
@@ -483,7 +1231,7 @@ local langBtn = mk("TextButton", {
     TextColor3 = COLORS.text,
 }, header)
 corner(langBtn, 6)
-stroke(langBtn, COLORS.red, 1)
+accentStroke(langBtn, 1)
 langBtn.Activated:Connect(function()
     S.lang = (S.lang == "EN") and "FR" or "EN"
     refreshAll()
@@ -495,14 +1243,14 @@ end)
 local hideBtn = mk("TextButton", {
     Size = UDim2.fromOffset(34, 24),
     Position = UDim2.new(1, -46, 0.5, -12),
-    BackgroundColor3 = COLORS.red,
     AutoButtonColor = false,
     Font = Enum.Font.GothamBold,
     TextSize = 14,
-    TextColor3 = COLORS.text,
     Text = "–",
 }, header)
 corner(hideBtn, 6)
+bindTheme(hideBtn, "BackgroundColor3", "accent")
+bindTheme(hideBtn, "TextColor3", "onAccent")
 
 makeDraggable(header, main)
 
@@ -528,15 +1276,19 @@ local pageHolder = mk("Frame", {
 corner(pageHolder, 8)
 
 local pages, tabButtons = {}, {}
+local currentTab = "aim"
 local buildPage = nil
 local applyState -- assigned below, after all UI exists
 
 local function selectTab(name)
+    currentTab = name
     for n, page in pairs(pages) do
         page.Visible = (n == name)
     end
     for n, btn in pairs(tabButtons) do
-        btn.BackgroundColor3 = (n == name) and COLORS.red or COLORS.row
+        local active = (n == name)
+        btn.BackgroundColor3 = active and theme.accent or COLORS.row
+        btn.TextColor3 = active and onAccentColor(theme.accent) or COLORS.text
     end
 end
 
@@ -547,11 +1299,11 @@ local function addTab(name, labelKey)
         BackgroundTransparency = 1,
         BorderSizePixel = 0,
         ScrollBarThickness = 3,
-        ScrollBarImageColor3 = COLORS.red,
         CanvasSize = UDim2.new(0, 0, 0, 0),
         AutomaticCanvasSize = Enum.AutomaticSize.Y,
         Visible = false,
     }, pageHolder)
+    bindTheme(page, "ScrollBarImageColor3", "accent")
     mk("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, page)
     mk("UIPadding", { PaddingRight = UDim.new(0, 6) }, page)
     pages[name] = page
@@ -607,10 +1359,10 @@ local function addSection(key)
         BackgroundTransparency = 1,
         Font = Enum.Font.GothamBold,
         TextSize = 11,
-        TextColor3 = COLORS.red,
         TextXAlignment = Enum.TextXAlignment.Left,
         LayoutOrder = nextOrder(),
     }, buildPage)
+    bindTheme(lbl, "TextColor3", "accent")
     register(function()
         lbl.Text = T(key)
     end)
@@ -639,7 +1391,7 @@ local function addToggle(key, get, set)
         lbl.Text = T(key)
         local on = get()
         local pos = on and UDim2.new(0, 25, 0.5, -8) or UDim2.new(0, 3, 0.5, -8)
-        local col = on and COLORS.red or COLORS.off
+        local col = on and theme.accent or COLORS.off
         if animate == true then
             TweenService:Create(knob, TweenInfo.new(0.12), { Position = pos }):Play()
             TweenService:Create(pill, TweenInfo.new(0.12), { BackgroundColor3 = col }):Play()
@@ -668,9 +1420,9 @@ local function addSlider(key, min, max, step, get, set)
         Size = UDim2.fromOffset(64, 26),
         Font = Enum.Font.GothamBold,
         TextSize = 13,
-        TextColor3 = COLORS.red,
         TextXAlignment = Enum.TextXAlignment.Right,
     }, row)
+    bindTheme(valLbl, "TextColor3", "accent")
     local hit = mk("TextButton", {
         Position = UDim2.new(0, 10, 0, 28),
         Size = UDim2.new(1, -20, 0, 22),
@@ -687,9 +1439,9 @@ local function addSlider(key, min, max, step, get, set)
     circle(rail)
     local fill = mk("Frame", {
         Size = UDim2.new(0, 0, 1, 0),
-        BackgroundColor3 = COLORS.red,
         BorderSizePixel = 0,
     }, rail)
+    bindTheme(fill, "BackgroundColor3", "accent")
     circle(fill)
     local knob = mk("Frame", {
         Size = UDim2.fromOffset(14, 14),
@@ -761,7 +1513,7 @@ local function addCycle(key, valueText, onClick)
         TextColor3 = COLORS.text,
     }, row)
     corner(btn, 6)
-    stroke(btn, COLORS.red, 1)
+    accentStroke(btn, 1)
     local function refresh()
         lbl.Text = T(key)
         btn.Text = valueText() .. "  ▾"
@@ -779,17 +1531,79 @@ local function addButton(key, fn)
     local btn = mk("TextButton", {
         Size = UDim2.new(1, -16, 0, 26),
         Position = UDim2.new(0, 8, 0.5, -13),
-        BackgroundColor3 = COLORS.red,
         AutoButtonColor = false,
         Font = Enum.Font.GothamBold,
         TextSize = 13,
-        TextColor3 = COLORS.text,
     }, row)
     corner(btn, 6)
+    bindTheme(btn, "BackgroundColor3", "accent")
+    bindTheme(btn, "TextColor3", "onAccent")
     btn.Activated:Connect(fn)
     register(function()
         btn.Text = T(key)
     end)
+end
+
+local function addInfo(textFn)
+    local row = newRow(72)
+    local lbl = mk("TextLabel", {
+        BackgroundTransparency = 1,
+        Position = UDim2.new(0, 10, 0, 4),
+        Size = UDim2.new(1, -20, 1, -8),
+        Font = Enum.Font.Gotham,
+        TextSize = 12,
+        TextColor3 = COLORS.dim,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextYAlignment = Enum.TextYAlignment.Top,
+        TextWrapped = true,
+    }, row)
+    local function update()
+        lbl.Text = textFn()
+    end
+    register(update)
+    return update
+end
+
+local function recoilStatusText()
+    if not S.noRecoil then
+        return T("recoil_off")
+    end
+    local n = #recoilList
+    if n == 0 then
+        return T("recoil_patched") .. " 0\n" .. T("recoil_none")
+    end
+    return T("recoil_patched") .. " " .. tostring(n)
+end
+
+------------------------------------------------------------------------
+-- Theme actions
+------------------------------------------------------------------------
+local function setAccent(color)
+    theme.accent = color
+    applyTheme()
+end
+
+local function setChannel(k, v)
+    local r, g, b = channel(theme.accent, "R"), channel(theme.accent, "G"), channel(theme.accent, "B")
+    if k == "R" then
+        r = v
+    elseif k == "G" then
+        g = v
+    else
+        b = v
+    end
+    setAccent(Color3.fromRGB(r, g, b))
+end
+
+-- Index of the preset that matches the current color exactly, or nil when the color is custom.
+local function currentPreset()
+    local r, g, b = channel(theme.accent, "R"), channel(theme.accent, "G"), channel(theme.accent, "B")
+    for i, p in ipairs(PRESETS) do
+        if channel(p.color, "R") == r and channel(p.color, "G") == g and channel(p.color, "B") == b then
+            return i
+        end
+    end
+    return nil
 end
 
 ------------------------------------------------------------------------
@@ -797,34 +1611,121 @@ end
 ------------------------------------------------------------------------
 addTab("aim", "tab_aim")
 addSection("sec_main")
-addToggle("aimbot", function() return S.aimbot end, function(v) S.aimbot = v end)
 addToggle("aimlock", function() return S.aimlock end, function(v) S.aimlock = v end)
-addCycle("aimkey",
-    function() return S.trigger == "Hold" and T("hold") or T("always") end,
-    function() S.trigger = (S.trigger == "Hold") and "Always" or "Hold" end)
 addCycle("target",
     function() return T(PART_KEYS[S.part]) end,
     function() S.part = (S.part % #PART_NAMES) + 1 end)
 addSlider("fov", 30, 600, 10, function() return S.fov end, function(v) S.fov = v end)
-addSlider("speed", 2, 40, 2, function() return S.speed end, function(v) S.speed = v end)
 addSlider("dist", 50, 2000, 50, function() return S.maxDist end, function(v) S.maxDist = v end)
 addSection("sec_filters")
 addToggle("teamcheck", function() return S.teamCheck end, function(v) S.teamCheck = v end)
 addToggle("wallcheck", function() return S.wallCheck end, function(v) S.wallCheck = v end)
 
-addTab("visuals", "tab_visuals")
+addTab("esp", "tab_esp")
 addSection("sec_esp")
-addToggle("chams", function() return S.chams end, function(v) S.chams = v end)
-addToggle("chamsteam", function() return S.chamsTeamCheck end, function(v) S.chamsTeamCheck = v end)
+addToggle("esp_line", function() return S.espLine end, function(v) S.espLine = v end)
+addToggle("esp_skeleton", function() return S.espSkeleton end, function(v) S.espSkeleton = v end)
+addToggle("esp_box", function() return S.espBox end, function(v) S.espBox = v end)
+addToggle("esp_name", function() return S.espName end, function(v) S.espName = v end)
+addToggle("esp_health", function() return S.espHealth end, function(v) S.espHealth = v end)
+addToggle("esp_dist", function() return S.espDistance end, function(v) S.espDistance = v end)
+addToggle("esp_team", function() return S.espTeamCheck end, function(v) S.espTeamCheck = v end)
+addSlider("esp_maxdist", 100, 3000, 100, function() return S.espMaxDist end, function(v) S.espMaxDist = v end)
 addSection("sec_overlay")
 addToggle("showfov", function() return S.showFov end, function(v) S.showFov = v end)
+
+addTab("weapon", "tab_weapon")
+addSection("sec_weapon")
+addToggle("norecoil", function() return S.noRecoil end, function(v)
+    S.noRecoil = v
+    if v then
+        pcall(scanRecoil)
+    else
+        restoreRecoil()
+    end
+    refreshAll()
+end)
+addInfo(recoilStatusText)
+onRecoilChanged = refreshAll
+
+local function perfStatusText()
+    return string.format(T("perf_line1"), math.floor(perf.fps + 0.5), math.floor(perf.espHz + 0.5), perf.level)
+        .. "\n" .. string.format(T("perf_line2"), perf.drawn, gfxChanged)
+end
+
+local function gfxAll(on)
+    for _, f in ipairs(GFX_ORDER) do
+        local flag = GFX_FLAG[f]
+        if S[flag] ~= on then
+            S[flag] = on
+            gfxSet(f, on)
+        end
+    end
+    refreshAll()
+end
+
+addTab("perf", "tab_perf")
+addSection("sec_perf")
+addToggle("adaptive", function() return S.adaptive end, function(v) S.adaptive = v end)
+addSlider("target_fps", 20, 60, 5, function() return S.targetFps end, function(v) S.targetFps = v end)
+addSlider("esp_rate", 10, 120, 5, function() return S.espRate end, function(v) S.espRate = v end)
+addSlider("esp_players", 5, 50, 5, function() return S.espMaxPlayers end, function(v) S.espMaxPlayers = v end)
+perfInfoUpdate = addInfo(perfStatusText)
+onGfxChanged = function()
+    if perfInfoUpdate then
+        perfInfoUpdate()
+    end
+end
+addSection("sec_gfx")
+addToggle("gfx_quality", function() return S.gfxQuality end, function(v)
+    S.gfxQuality = v
+    gfxSet("quality", v)
+end)
+addToggle("gfx_shadows", function() return S.gfxShadows end, function(v)
+    S.gfxShadows = v
+    gfxSet("shadows", v)
+end)
+addToggle("gfx_materials", function() return S.gfxMaterials end, function(v)
+    S.gfxMaterials = v
+    gfxSet("materials", v)
+end)
+addToggle("gfx_effects", function() return S.gfxEffects end, function(v)
+    S.gfxEffects = v
+    gfxSet("effects", v)
+end)
+addToggle("gfx_particles", function() return S.gfxParticles end, function(v)
+    S.gfxParticles = v
+    gfxSet("particles", v)
+end)
+addToggle("gfx_water", function() return S.gfxWater end, function(v)
+    S.gfxWater = v
+    gfxSet("water", v)
+end)
+addButton("gfx_all_on", function() gfxAll(true) end)
+addButton("gfx_all_off", function() gfxAll(false) end)
 
 addTab("settings", "tab_settings")
 addSection("sec_interface")
 addCycle("language",
     function() return S.lang == "EN" and "English" or "Français" end,
     function() S.lang = (S.lang == "EN") and "FR" or "EN" end)
-addToggle("moveaim", function() return aimUnlocked end, function(v) aimUnlocked = v end)
+
+addSection("sec_theme")
+addCycle("theme_preset",
+    function()
+        local i = currentPreset()
+        return i and T(PRESETS[i].key) or T("pr_custom")
+    end,
+    function()
+        local i = currentPreset() or 0
+        setAccent(PRESETS[(i % #PRESETS) + 1].color)
+    end)
+addSlider("theme_r", 0, 255, 1, function() return channel(theme.accent, "R") end, function(v) setChannel("R", v) end)
+addSlider("theme_g", 0, 255, 1, function() return channel(theme.accent, "G") end, function(v) setChannel("G", v) end)
+addSlider("theme_b", 0, 255, 1, function() return channel(theme.accent, "B") end, function(v) setChannel("B", v) end)
+addButton("theme_reset", function()
+    setAccent(DEFAULT_ACCENT)
+end)
 
 local unload -- assigned below
 addButton("unload", function()
@@ -833,13 +1734,21 @@ end)
 
 selectTab("aim")
 
+applyTheme = function()
+    local acc = theme.accent
+    local onAcc = onAccentColor(acc)
+    for _, b in ipairs(themed) do
+        b.inst[b.prop] = (b.kind == "accent") and acc or onAcc
+    end
+    updateTitle()
+    selectTab(currentTab)
+    refreshAll()
+end
+
 applyState = function()
     fovCircle.Size = UDim2.fromOffset(S.fov * 2, S.fov * 2)
-    local aimOn = S.aimbot or S.aimlock
-    fovCircle.Visible = S.showFov and aimOn
-    aimBtn.Visible = aimUnlocked or (aimOn and S.trigger == "Hold")
-    aimBtn.BackgroundColor3 = aimUnlocked and COLORS.amber or COLORS.red
-    if not aimOn or not S.aimlock then
+    fovCircle.Visible = S.showFov and S.aimlock
+    if not S.aimlock then
         lockedPlayer = nil
     end
 end
@@ -860,135 +1769,460 @@ local toggleBtn = mk("TextButton", {
     Name = "ToggleButton",
     Size = UDim2.fromOffset(44, 44),
     Position = UDim2.new(0, 70, 0.5, -22),
-    BackgroundColor3 = COLORS.red,
-    Text = "UG",
+    Text = "V2",
     Font = Enum.Font.GothamBold,
     TextSize = 15,
-    TextColor3 = COLORS.text,
     AutoButtonColor = false,
 }, gui)
 circle(toggleBtn)
+bindTheme(toggleBtn, "BackgroundColor3", "accent")
+bindTheme(toggleBtn, "TextColor3", "onAccent")
 stroke(toggleBtn, COLORS.text, 1.5)
 makeDraggable(toggleBtn, toggleBtn, function()
     setMenuVisible(not main.Visible)
 end)
 
-track(UserInputService.InputBegan:Connect(function(input)
+-- PC keyboard shortcut only. Fire-input handling lives in the touch/mouse block above.
+track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
+    if gameProcessed then
+        return
+    end
     if UserInputService:GetFocusedTextBox() then
         return
     end
     if input.KeyCode == Enum.KeyCode.RightShift then
         setMenuVisible(not main.Visible)
-    elseif input.UserInputType == Enum.UserInputType.MouseButton2 then
-        rmbHeld = true
-    end
-end))
-track(UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton2 then
-        rmbHeld = false
     end
 end))
 
 ------------------------------------------------------------------------
--- Chams (Highlight objects, red fill, visible through walls)
+-- ESP (drawn with Frames, so it needs no Drawing library and works on PC, Android and iOS)
+-- Screen space: viewport pixels, origin top-left. Snaplines start at the top-center of the screen.
 ------------------------------------------------------------------------
-local MAX_HIGHLIGHTS = 31 -- Roblox limits simultaneously active Highlights
-local highlights = {}
+local ESP_COLOR = Color3.fromRGB(210, 32, 44) -- ESP keeps its own color, independent of the menu theme
 
-local function clearChams()
-    for plr, h in pairs(highlights) do
-        h:Destroy()
-        highlights[plr] = nil
+local BONES_R15 = {
+    { "Head", "UpperTorso" }, { "UpperTorso", "LowerTorso" },
+    { "UpperTorso", "LeftUpperArm" }, { "LeftUpperArm", "LeftLowerArm" }, { "LeftLowerArm", "LeftHand" },
+    { "UpperTorso", "RightUpperArm" }, { "RightUpperArm", "RightLowerArm" }, { "RightLowerArm", "RightHand" },
+    { "LowerTorso", "LeftUpperLeg" }, { "LeftUpperLeg", "LeftLowerLeg" }, { "LeftLowerLeg", "LeftFoot" },
+    { "LowerTorso", "RightUpperLeg" }, { "RightUpperLeg", "RightLowerLeg" }, { "RightLowerLeg", "RightFoot" },
+}
+local BONES_R6 = {
+    { "Head", "Torso" }, { "Torso", "Left Arm" }, { "Torso", "Right Arm" },
+    { "Torso", "Left Leg" }, { "Torso", "Right Leg" },
+}
+
+local espObjects = {}
+local espCand, espCandChar, espCandHum, espCandRoot, espCandDist, espOrder = {}, {}, {}, {}, {}, {}
+local espStamp = 0
+
+-- Property writes are the expensive part of drawing, so a value is only written when it changed.
+local function put(o, inst, prop, value)
+    local c = o.cache[inst]
+    if c == nil then
+        c = {}
+        o.cache[inst] = c
+    end
+    if c[prop] ~= value then
+        c[prop] = value
+        inst[prop] = value
     end
 end
 
-local function updateChams()
-    if not S.chams then
-        clearChams()
+local function setLine(o, frame, a, b, thickness)
+    local d = b - a
+    local len = d.Magnitude
+    if len < 1 then
+        put(o, frame, "Visible", false)
         return
     end
-    local used = 0
-    local present = {}
-    for _, plr in ipairs(Players:GetPlayers()) do
-        present[plr] = true
-        local char = nil
-        if plr ~= LocalPlayer then
-            char = plr.Character
+    put(o, frame, "Size", UDim2.fromOffset(len, thickness))
+    put(o, frame, "Position", UDim2.fromOffset((a.X + b.X) / 2, (a.Y + b.Y) / 2))
+    put(o, frame, "Rotation", math.deg(math.atan2(d.Y, d.X)))
+    put(o, frame, "Visible", true)
+end
+
+local function createEspObject()
+    local o = { all = {}, bones = {}, cache = {}, hidden = true, stamp = 0 }
+    local function add(inst)
+        table.insert(o.all, inst)
+        return inst
+    end
+    local function label(anchor)
+        return add(mk("TextLabel", {
+            AnchorPoint = anchor,
+            Size = UDim2.fromOffset(160, 14),
+            BackgroundTransparency = 1,
+            Font = Enum.Font.GothamBold,
+            TextSize = 12,
+            TextColor3 = COLORS.text,
+            TextStrokeTransparency = 0.4,
+            Visible = false,
+        }, espLayer))
+    end
+    local function lineFrame()
+        return add(mk("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            BackgroundColor3 = ESP_COLOR,
+            BorderSizePixel = 0,
+            Visible = false,
+        }, espLayer))
+    end
+    o.makeLine = lineFrame -- skeleton lines are created only when the skeleton is first drawn
+
+    o.box = add(mk("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false }, espLayer))
+    stroke(o.box, ESP_COLOR, 1.5)
+    o.name = label(Vector2.new(0.5, 1))
+    o.dist = label(Vector2.new(0.5, 0))
+    o.hpBack = add(mk("Frame", {
+        BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+        BackgroundTransparency = 0.35,
+        BorderSizePixel = 0,
+        Visible = false,
+    }, espLayer))
+    o.hpFill = mk("Frame", {
+        AnchorPoint = Vector2.new(0, 1),
+        Position = UDim2.new(0, 0, 1, 0),
+        Size = UDim2.new(1, 0, 1, 0),
+        BorderSizePixel = 0,
+    }, o.hpBack)
+    o.snap = lineFrame()
+    return o
+end
+
+local function hideEsp(o)
+    for _, inst in ipairs(o.all) do
+        put(o, inst, "Visible", false)
+    end
+    o.hidden = true
+end
+
+local function destroyEsp(o)
+    for _, inst in ipairs(o.all) do
+        inst:Destroy()
+    end
+end
+
+local function destroyAllEsp()
+    for plr, o in pairs(espObjects) do
+        destroyEsp(o)
+        espObjects[plr] = nil
+    end
+end
+
+track(Players.PlayerRemoving:Connect(function(p)
+    local o = espObjects[p]
+    if o then
+        destroyEsp(o)
+        espObjects[p] = nil
+    end
+end))
+
+-- Returns true if anything was placed on screen for this player.
+local function drawEsp(o, plr, char, hum, root, cam, vp, dist, lvl)
+    local head = char:FindFirstChild("Head")
+    local headPos
+    if head and head:IsA("BasePart") then
+        headPos = head.Position
+    else
+        headPos = root.Position + Vector3.new(0, 2, 0)
+    end
+    local top = cam:WorldToViewportPoint(headPos + Vector3.new(0, 0.7, 0))
+    local bottom = cam:WorldToViewportPoint(root.Position - Vector3.new(0, 3, 0))
+    if top.Z <= 0 or bottom.Z <= 0 then
+        return false
+    end
+    local h = bottom.Y - top.Y
+    if h < 4 then
+        return false
+    end
+    local w = h * 0.55
+    local cx = (top.X + bottom.X) / 2
+    if cx + w < 0 or cx - w > vp.X or bottom.Y < 0 or top.Y > vp.Y then
+        return false
+    end
+    local left = cx - w / 2
+
+    if S.espBox then
+        put(o, o.box, "Position", UDim2.fromOffset(left, top.Y))
+        put(o, o.box, "Size", UDim2.fromOffset(w, h))
+        put(o, o.box, "Visible", true)
+    else
+        put(o, o.box, "Visible", false)
+    end
+
+    if S.espName then
+        put(o, o.name, "Text", (plr.DisplayName ~= "") and plr.DisplayName or plr.Name)
+        put(o, o.name, "Position", UDim2.fromOffset(cx, top.Y - 2))
+        put(o, o.name, "Visible", true)
+    else
+        put(o, o.name, "Visible", false)
+    end
+
+    if S.espDistance then
+        put(o, o.dist, "Text", string.format("%dm", math.floor(dist + 0.5)))
+        put(o, o.dist, "Position", UDim2.fromOffset(cx, bottom.Y + 2))
+        put(o, o.dist, "Visible", true)
+    else
+        put(o, o.dist, "Visible", false)
+    end
+
+    if S.espHealth then
+        local maxHp = hum.MaxHealth
+        local ratio = 0
+        if maxHp > 0 then
+            ratio = math.clamp(hum.Health / maxHp, 0, 1)
         end
-        local want = false
-        if char and char.Parent then
-            local hum = char:FindFirstChildOfClass("Humanoid")
-            want = hum ~= nil and hum.Health > 0 and (not S.chamsTeamCheck or isEnemy(plr))
-        end
-        if want and used < MAX_HIGHLIGHTS then
-            used += 1
-            local h = highlights[plr]
-            if not h or not h.Parent then
-                h = mk("Highlight", {
-                    FillColor = COLORS.red,
-                    OutlineColor = Color3.fromRGB(255, 255, 255),
-                    FillTransparency = 0.45,
-                    OutlineTransparency = 0,
-                    DepthMode = Enum.HighlightDepthMode.AlwaysOnTop,
-                }, chamsFolder)
-                highlights[plr] = h
+        put(o, o.hpBack, "Position", UDim2.fromOffset(left - 6, top.Y))
+        put(o, o.hpBack, "Size", UDim2.fromOffset(3, h))
+        put(o, o.hpFill, "Size", UDim2.new(1, 0, ratio, 0))
+        put(o, o.hpFill, "BackgroundColor3", Color3.fromHSV(ratio * 0.33, 1, 1))
+        put(o, o.hpBack, "Visible", true)
+    else
+        put(o, o.hpBack, "Visible", false)
+    end
+
+    if S.espLine and lvl.lines then
+        setLine(o, o.snap, Vector2.new(vp.X / 2, 0), Vector2.new(cx, bottom.Y), 1.5)
+    else
+        put(o, o.snap, "Visible", false)
+    end
+
+    if S.espSkeleton and lvl.skeleton then
+        local bones = (hum.RigType == Enum.HumanoidRigType.R15) and BONES_R15 or BONES_R6
+        for i, pair in ipairs(bones) do
+            local line = o.bones[i]
+            if not line then
+                line = o.makeLine()
+                o.bones[i] = line
             end
-            if h.Adornee ~= char then
-                h.Adornee = char
+            local a, b = char:FindFirstChild(pair[1]), char:FindFirstChild(pair[2])
+            if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+                local pa = cam:WorldToViewportPoint(a.Position)
+                local pb = cam:WorldToViewportPoint(b.Position)
+                if pa.Z > 0 and pb.Z > 0 then
+                    setLine(o, line, Vector2.new(pa.X, pa.Y), Vector2.new(pb.X, pb.Y), 1.5)
+                else
+                    put(o, line, "Visible", false)
+                end
+            else
+                put(o, line, "Visible", false)
+            end
+        end
+        for i = #bones + 1, #o.bones do
+            put(o, o.bones[i], "Visible", false)
+        end
+    else
+        for _, line in ipairs(o.bones) do
+            put(o, line, "Visible", false)
+        end
+    end
+
+    return true
+end
+
+local function espAnyOn()
+    return S.espLine or S.espSkeleton or S.espBox or S.espName or S.espHealth or S.espDistance
+end
+
+local function espDistLess(a, b)
+    return espCandDist[a] < espCandDist[b]
+end
+
+local function espStepInner()
+    if not espAnyOn() then
+        destroyAllEsp()
+        perf.drawn = 0
+        return
+    end
+    local cam = Workspace.CurrentCamera
+    if not cam then
+        return
+    end
+    perf.espSteps += 1
+    local vp = cam.ViewportSize
+    local camPos = cam.CFrame.Position
+    local lvl = ADAPT_LEVELS[perf.level]
+    local limit = math.min(S.espMaxPlayers, lvl.players)
+
+    -- 1) collect the players that qualify (alive, enemy, in range)
+    local n = 0
+    for _, plr in ipairs(playerList) do
+        if plr ~= LocalPlayer then
+            local char = plr.Character
+            local hum = char and char:FindFirstChildOfClass("Humanoid")
+            local root = char and char:FindFirstChild("HumanoidRootPart")
+            if hum and root and root:IsA("BasePart") and hum.Health > 0
+                and (not S.espTeamCheck or isEnemy(plr)) then
+                local dist = (root.Position - camPos).Magnitude
+                if dist <= S.espMaxDist then
+                    n += 1
+                    espCand[n], espCandChar[n], espCandHum[n], espCandRoot[n], espCandDist[n] = plr, char, hum, root, dist
+                    espOrder[n] = n
+                end
+            end
+        end
+    end
+    for i = #espCand, n + 1, -1 do
+        espCand[i], espCandChar[i], espCandHum[i], espCandRoot[i], espCandDist[i], espOrder[i] =
+            nil, nil, nil, nil, nil, nil
+    end
+
+    -- 2) nearest first, only when there are more candidates than the draw limit
+    if n > limit then
+        table.sort(espOrder, espDistLess)
+    end
+
+    -- 3) draw up to the limit
+    espStamp += 1
+    local drawnCount = 0
+    for k = 1, n do
+        if k > limit then
+            break
+        end
+        local idx = espOrder[k]
+        local plr = espCand[idx]
+        local o = espObjects[plr]
+        if not o then
+            o = createEspObject()
+            espObjects[plr] = o
+        end
+        if drawEsp(o, plr, espCandChar[idx], espCandHum[idx], espCandRoot[idx], cam, vp, espCandDist[idx], lvl) then
+            o.stamp = espStamp
+            o.hidden = false
+            drawnCount += 1
+        end
+    end
+    perf.drawn = drawnCount
+
+    -- 4) hide everything that was not drawn this step (once, not on every step)
+    for _, o in pairs(espObjects) do
+        if o.stamp ~= espStamp and not o.hidden then
+            hideEsp(o)
+        end
+    end
+end
+
+-- ESP refresh is capped (S.espRate, and the auto level can lower it further).
+local espAcc = 0
+local espErrorShown = false
+local function espStep(dt)
+    espAcc += dt
+    local rate = math.min(S.espRate, ADAPT_LEVELS[perf.level].rate)
+    local interval = 1 / rate
+    if espAcc < interval * 0.9 then
+        return
+    end
+    espAcc -= interval
+    if espAcc > interval then
+        espAcc = 0
+    end
+    local ok, err = pcall(espStepInner)
+    if not ok and not espErrorShown then
+        espErrorShown = true
+        warn("[PanelV2] esp error: " .. tostring(err))
+    end
+end
+
+-- Samples FPS once per second and moves perf.level (auto optimize). Does nothing unless ESP is on.
+local function perfStepInner(dt)
+    perf.frames += 1
+    perf.acc += dt
+    if perf.acc < 1 then
+        return
+    end
+    perf.fps = perf.frames / perf.acc
+    perf.espHz = perf.espSteps / perf.acc
+    perf.frames, perf.espSteps, perf.acc = 0, 0, 0
+    if S.adaptive and espAnyOn() then
+        if perf.fps < S.targetFps * 0.9 then
+            perf.good = 0
+            perf.bad += 1
+            if perf.bad >= 2 and perf.level < 3 then
+                perf.level += 1
+                perf.bad = 0
+            end
+        elseif perf.fps > S.targetFps * 1.2 then
+            perf.bad = 0
+            perf.good += 1
+            if perf.good >= 6 and perf.level > 0 then
+                perf.level -= 1
+                perf.good = 0
             end
         else
-            local h = highlights[plr]
-            if h then
-                h:Destroy()
-                highlights[plr] = nil
-            end
+            perf.bad, perf.good = 0, 0
         end
+    else
+        perf.level, perf.bad, perf.good = 0, 0, 0
     end
-    for plr, h in pairs(highlights) do
-        if not present[plr] then
-            h:Destroy()
-            highlights[plr] = nil
-        end
+    if perfInfoUpdate and main.Visible and currentTab == "perf" then
+        perfInfoUpdate()
     end
 end
 
-local chamsAcc = 0
-local chamsErrorShown = false
+local perfErrorShown = false
+local function perfStep(dt)
+    local ok, err = pcall(perfStepInner, dt)
+    if not ok and not perfErrorShown then
+        perfErrorShown = true
+        warn("[PanelV2] perf error: " .. tostring(err))
+    end
+end
+
+-- No Recoil keeps re-checking once per second while the switch is on.
+local recoilAcc = 0
+local recoilErrorShown = false
 track(RunService.Heartbeat:Connect(function(dt)
-    chamsAcc += dt
-    if chamsAcc < 0.25 then
+    if not S.noRecoil then
         return
     end
-    chamsAcc = 0
-    local ok, err = pcall(updateChams)
-    if not ok and not chamsErrorShown then
-        chamsErrorShown = true
-        warn("[UrbanGhost] chams error: " .. tostring(err))
+    recoilAcc += dt
+    if recoilAcc < 1 then
+        return
+    end
+    recoilAcc = 0
+    local ok, err = pcall(scanRecoil)
+    if not ok and not recoilErrorShown then
+        recoilErrorShown = true
+        warn("[PanelV2] no-recoil error: " .. tostring(err))
     end
 end))
 
 ------------------------------------------------------------------------
 -- Aim loop and shutdown
 ------------------------------------------------------------------------
-RunService:BindToRenderStep("UrbanGhostAim", Enum.RenderPriority.Camera.Value + 1, aimStep)
+RunService:BindToRenderStep("PanelV2Aim", Enum.RenderPriority.Camera.Value + 1, aimStep)
+RunService:BindToRenderStep("PanelV2Esp", Enum.RenderPriority.Camera.Value + 2, espStep)
+RunService:BindToRenderStep("PanelV2Perf", Enum.RenderPriority.Camera.Value + 3, perfStep)
 
 unload = function()
     if not alive then
         return
     end
     alive = false
-    aimHeld, rmbHeld, lockedPlayer = false, false, nil
+    mouseFire, touchFire, toolFire, lockedPlayer = false, false, false, nil
+    buttonInputs = {}
     pcall(function()
-        RunService:UnbindFromRenderStep("UrbanGhostAim")
+        RunService:UnbindFromRenderStep("PanelV2Aim")
+    end)
+    pcall(function()
+        RunService:UnbindFromRenderStep("PanelV2Esp")
+    end)
+    pcall(function()
+        RunService:UnbindFromRenderStep("PanelV2Perf")
     end)
     for _, c in ipairs(conns) do
         pcall(function()
             c:Disconnect()
         end)
     end
-    clearChams()
+    clearToolConns()
+    destroyAllEsp()
+    restoreRecoil()
+    pcall(gfxShutdown)
     pcall(function()
-        chamsFolder:Destroy()
+        espGui:Destroy()
     end)
     pcall(function()
         gui:Destroy()
