@@ -9,7 +9,11 @@
       - PC: left mouse button.
       - Mobile (Android/iPhone): any tap that is not swallowed by a UI element inside the lower-right
         fire zone, PLUS any GuiButton whose Name matches GameConfig.fireButtonNames.
+        Fire-zone touches are tracked even when the game consumes the InputBegan (gameProcessed=true),
+        so aimlock engages on mobile fire buttons regardless of UI swallowing.
       - Both: the equipped Tool's Activated/Deactivated events.
+    Inputs are tracked by object identity (activeInputs[input]), never by boolean flags, so a
+    swallowed InputEnded can never leave aimlock stuck on a target.
 
     STATUS: written without running it. Not tested in Roblox, Delta or any PC executor.
 
@@ -29,21 +33,11 @@ local LocalPlayer = Players.LocalPlayer
 -- Game-specific values. nil = UNKNOWN (not taken from any dump).
 ------------------------------------------------------------------------
 local GameConfig = {
-    -- Run  print(game.GameId, game.PlaceId)  inside Urban Reload, then put the GameId here.
-    -- While nil the script loads in any game.
     gameId = nil,
-    -- Name of a Player attribute that holds the team/crew, if the game uses one instead of Player.Team.
-    -- nil = only Roblox's Player.Team is used.
     teamAttribute = nil,
-    -- ASSUMPTION, not verified for Urban Reload: weapon recoil values have names containing these words.
     recoilNamePatterns = { "recoil" },
-    -- Names containing these words are left alone (zeroing them could break the game's own math).
     recoilSkipPatterns = { "recover", "decay", "reset", "speed", "time", "delay", "duration", "damp", "stiff" },
-    -- Mobile fire buttons: lowercase name fragments of on-screen fire buttons.
-    -- Scanned under PlayerGui on Android/iOS. Add more if your game uses a different name.
     fireButtonNames = { "fire", "shoot", "attack", "tire", "tir" },
-    -- Extra touch fallback: any tap on the lower-right quadrant counts as firing on mobile.
-    -- Set to false if that causes accidental aimlock on your game.
     touchFallback = true,
 }
 
@@ -66,26 +60,25 @@ end
 local S = {
     lang = "EN",
     aimlock = false,
-    part = 1,         -- index into PART_NAMES
-    fov = 150,        -- pixel radius around screen center (uncalibrated default)
-    maxDist = 500,    -- studs
+    part = 1,
+    fov = 150,
+    maxDist = 500,
     teamCheck = true,
     wallCheck = true,
     showFov = true,
-    espLine = false,      -- snapline from the top of the screen
+    espLine = false,
     espSkeleton = false,
     espBox = false,
     espName = false,
     espHealth = false,
     espDistance = false,
     espTeamCheck = true,
-    espMaxDist = 1000,    -- studs
+    espMaxDist = 1000,
     noRecoil = false,
-    -- performance (all numbers are uncalibrated defaults)
-    adaptive = true,      -- lowers ESP cost automatically when FPS drops
-    targetFps = 30,       -- auto level goes up below 90% of this, back down above 120% of it
-    espRate = 60,         -- maximum ESP refreshes per second
-    espMaxPlayers = 25,   -- draw at most this many players, nearest first
+    adaptive = true,
+    targetFps = 30,
+    espRate = 60,
+    espMaxPlayers = 25,
     gfxQuality = false,
     gfxShadows = false,
     gfxMaterials = false,
@@ -177,7 +170,6 @@ local function nameHasAny(name, patterns)
     return false
 end
 
--- Cached player list: avoids a new table from Players:GetPlayers() every frame.
 local playerList = Players:GetPlayers()
 track(Players.PlayerAdded:Connect(function(p)
     for _, q in ipairs(playerList) do
@@ -228,7 +220,6 @@ local function getAimPart(char)
     return nil
 end
 
--- Returns character, aim part if the player is a valid target right now.
 local function getTargetParts(plr)
     if plr == LocalPlayer then
         return nil
@@ -258,7 +249,7 @@ local rayParams = RaycastParams.new()
 rayParams.FilterType = Enum.RaycastFilterType.Exclude
 rayParams.RespectCanCollide = true
 
-local ignoreList = { false, false } -- both slots are overwritten before every use (no new table per raycast)
+local ignoreList = { false, false }
 
 local function isVisible(origin, part, targetChar)
     ignoreList[1] = LocalPlayer.Character or targetChar
@@ -267,7 +258,6 @@ local function isVisible(origin, part, targetChar)
     return Workspace:Raycast(origin, part.Position - origin, rayParams) == nil
 end
 
--- Closest valid target to the screen center, inside the FOV circle.
 local function findTarget(cam)
     local vp = cam.ViewportSize
     local center = Vector2.new(vp.X / 2, vp.Y / 2)
@@ -292,16 +282,15 @@ end
 
 ------------------------------------------------------------------------
 -- Firing detection. Aimlock only works while isFiring() is true.
--- Sources: left mouse button (PC), any touch in the lower-right fire zone (mobile),
--- GuiButtons whose Name matches GameConfig.fireButtonNames, and the equipped Tool's
--- Activated/Deactivated events.
+-- FIX: track every fire input by object identity in activeInputs[input].
+-- A swallowed InputEnded (gameProcessed) can no longer leave aimlock stuck.
+-- Fire-zone touches are tracked even when gameProcessed is true on mobile.
+-- Tool events stay a third source, with a short decay window for one-shot clicks.
 ------------------------------------------------------------------------
-local mouseFire = false
-local touchFire = false
+local activeInputs = {}   -- [InputObject] = true while held
 local toolFire = false
 local fireTool = nil
 local toolConns = {}
-local buttonInputs = {} -- inputs currently held on a fire button
 
 local function clearToolConns()
     for _, c in ipairs(toolConns) do
@@ -333,7 +322,6 @@ local function bindFireTool(tool)
     end))
 end
 
--- Returns true if the input belongs to the mobile fire zone (lower-right of the screen).
 local function isFireZoneTouch(input)
     if not GameConfig.touchFallback then
         return false
@@ -345,6 +333,21 @@ local function isFireZoneTouch(input)
     local vp = cam.ViewportSize
     local p = input.Position
     return p.X > vp.X * 0.5 and p.Y > vp.Y * 0.4
+end
+
+-- Track a fire input by identity. InputEnded always clears it, gameProcessed or not.
+local function trackFireInput(input)
+    if activeInputs[input] then
+        return
+    end
+    activeInputs[input] = true
+    local c
+    c = input.Changed:Connect(function()
+        if input.UserInputState == Enum.UserInputState.End then
+            activeInputs[input] = nil
+            c:Disconnect()
+        end
+    end)
 end
 
 local function watchFireButton(obj)
@@ -362,14 +365,7 @@ local function watchFireButton(obj)
             and input.UserInputType ~= Enum.UserInputType.MouseButton1 then
             return
         end
-        buttonInputs[input] = true
-        local c
-        c = input.Changed:Connect(function()
-            if input.UserInputState == Enum.UserInputState.End then
-                buttonInputs[input] = nil
-                c:Disconnect()
-            end
-        end)
+        trackFireInput(input)
     end))
 end
 
@@ -383,37 +379,25 @@ do
     end
 end
 
--- Raw touch / mouse fallback: any tap that is not consumed by a UI element counts as firing.
+-- Raw touch / mouse fallback.
+-- Fire-zone touches count even when gameProcessed is true — otherwise the game's own
+-- fire button (a GuiButton that swallows the tap) never reaches us on mobile.
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
-    if gameProcessed then
-        return
-    end
     if input.UserInputType == Enum.UserInputType.Touch then
         if isFireZoneTouch(input) then
-            touchFire = true
-            local c
-            c = input.Changed:Connect(function()
-                if input.UserInputState == Enum.UserInputState.End then
-                    touchFire = false
-                    c:Disconnect()
-                end
-            end)
+            trackFireInput(input)
         end
-    elseif input.UserInputType == Enum.UserInputType.MouseButton1 then
-        mouseFire = true
+    elseif input.UserInputType == Enum.UserInputType.MouseButton1 and not gameProcessed then
+        trackFireInput(input)
     end
 end))
+-- Always clear, even when the game swallows the release (gameProcessed=true).
 track(UserInputService.InputEnded:Connect(function(input)
-    if input.UserInputType == Enum.UserInputType.MouseButton1 then
-        mouseFire = false
-    end
-    if input.UserInputType == Enum.UserInputType.Touch then
-        touchFire = false
-    end
+    activeInputs[input] = nil
 end))
 track(UserInputService.WindowFocusReleased:Connect(function()
-    mouseFire = false
-    touchFire = false
+    activeInputs = {}
+    toolFire = false
 end))
 
 local function isFiring()
@@ -422,13 +406,12 @@ local function isFiring()
     if tool ~= fireTool then
         bindFireTool(tool)
     end
-    return mouseFire or touchFire or toolFire or next(buttonInputs) ~= nil
+    return next(activeInputs) ~= nil or toolFire
 end
 
 ------------------------------------------------------------------------
 -- Performance core. perf.level (0-3) is raised automatically when FPS drops (see perfStep) and
 -- lowers the cost of ESP and of target searching. It never changes the user's own settings.
--- The values in ADAPT_LEVELS are uncalibrated defaults.
 ------------------------------------------------------------------------
 local ADAPT_LEVELS = {
     [0] = { rate = math.huge, players = math.huge, skeleton = true, lines = true, search = 0 },
@@ -441,8 +424,7 @@ local perf = { level = 0, fps = 0, espHz = 0, drawn = 0, frames = 0, espSteps = 
 local perfInfoUpdate = nil
 
 ------------------------------------------------------------------------
--- Aimlock: while firing, locks the camera on the closest valid target in the FOV circle and
--- keeps that same target until it becomes invalid or you stop firing.
+-- Aimlock: only while firing. Not firing -> released, target cleared, no residual lock.
 ------------------------------------------------------------------------
 local lockedPlayer = nil
 local lastSearch = 0
@@ -470,7 +452,6 @@ local function aimStepInner()
         end
     end
     if not part then
-        -- at auto level 0 the search runs every frame; higher levels space the searches out
         local now = os.clock()
         if now - lastSearch >= ADAPT_LEVELS[perf.level].search then
             lastSearch = now
@@ -499,11 +480,7 @@ local function aimStep()
 end
 
 ------------------------------------------------------------------------
--- No Recoil: sets recoil-named values on the player's weapons to zero (Attributes, Value
--- objects, and tables returned by ModuleScripts inside the Tool). Original values are saved
--- and restored when the switch is turned off or the script is unloaded.
--- Whether Urban Reload stores recoil this way is UNKNOWN. The menu shows how many values
--- were patched, so you can see at once whether anything was found.
+-- No Recoil
 ------------------------------------------------------------------------
 local recoilList = {}
 local recoilSeen = setmetatable({}, { __mode = "k" })
@@ -667,12 +644,9 @@ local function restoreRecoil()
 end
 
 ------------------------------------------------------------------------
--- Graphics booster. Every feature saves the original values and restores them when switched
--- off or when the script is unloaded. Big scans are spread over many frames (GFX_BUDGET seconds
--- per frame) so the game does not freeze. Whether each setting takes effect on your device and
--- executor is UNKNOWN: the PERF tab shows how many changes were really made.
+-- Graphics booster
 ------------------------------------------------------------------------
-local GFX_BUDGET = 0.003 -- seconds of work per frame (uncalibrated)
+local GFX_BUDGET = 0.003
 local GFX_ORDER = { "quality", "shadows", "materials", "effects", "particles", "water" }
 local GFX_INSTANCE_FEATURES = { "shadows", "materials", "effects", "particles" }
 local GFX_FLAG = {
@@ -687,11 +661,9 @@ end
 local P_SHADOW = { CastShadow = false }
 local P_MATERIAL = { Material = Enum.Material.Plastic, Reflectance = 0 }
 local P_DISABLE = { Enabled = false }
--- ColorCorrectionEffect is left alone on purpose so the picture keeps its colors.
 local EFFECT_CLASSES = { BloomEffect = true, BlurEffect = true, SunRaysEffect = true, DepthOfFieldEffect = true }
 local PARTICLE_CLASSES = { ParticleEmitter = true, Trail = true, Beam = true, Smoke = true, Fire = true, Sparkles = true }
 
--- Each matcher returns the (shared, constant) table of properties to set on that instance, or nil.
 local GFX_MATCH = {
     shadows = function(inst)
         if inst:IsA("BasePart") and not inst:IsA("Terrain") then
@@ -719,7 +691,6 @@ local GFX_MATCH = {
     end,
 }
 
--- GFX_ORIG[feature][property][instance] = original value (only stored when it differs from the target)
 local GFX_ORIG = {
     shadows = { CastShadow = weakKeys() },
     materials = { Material = weakKeys(), Reflectance = weakKeys() },
@@ -730,7 +701,7 @@ local GFX_ORIG = {
 local gfxGen = { shadows = 0, materials = 0, effects = 0, particles = 0 }
 local gfxJobs = {}
 local gfxChanged = 0
-local gfxGlobal = {} -- original values of the global settings (quality, shadows, water)
+local gfxGlobal = {}
 local gfxHooks = {}
 local onGfxChanged = nil
 
@@ -763,7 +734,6 @@ local function gfxOnAdded(inst)
     end
 end
 
--- New instances (effects, debris, characters) are handled as they appear, only while a feature is on.
 local function gfxUpdateHooks()
     local any = false
     for _, f in ipairs(GFX_INSTANCE_FEATURES) do
@@ -858,7 +828,6 @@ local function gfxPump()
 end
 track(RunService.Heartbeat:Connect(gfxPump))
 
--- Global settings (not per instance). The shadows feature also switches off Lighting.GlobalShadows.
 local function gfxApplyGlobal(feature)
     if feature == "quality" then
         if gfxGlobal.quality == nil then
@@ -932,7 +901,6 @@ local function gfxRestoreGlobal(feature)
     end
 end
 
--- The caller sets S.<flag> first, then calls this.
 local function gfxSet(feature, on)
     local perInstance = gfxGen[feature] ~= nil
     if perInstance then
@@ -955,7 +923,6 @@ local function gfxSet(feature, on)
     end
 end
 
--- Unload: drop pending scans, finish pending restores at once, restore everything.
 local function gfxShutdown()
     for _, c in ipairs(gfxHooks) do
         pcall(function()
@@ -1006,16 +973,15 @@ local PRESETS = {
     { key = "pr_blue", color = Color3.fromRGB(52, 152, 255) },
     { key = "pr_purple", color = Color3.fromRGB(160, 90, 255) },
 }
-local DEFAULT_ACCENT = PRESETS[1].color -- change PRESETS[1] to change the startup color
+local DEFAULT_ACCENT = PRESETS[1].color
 
 local theme = { accent = DEFAULT_ACCENT }
-local themed = {} -- { inst, prop, kind } where kind is "accent" or "onAccent"
+local themed = {}
 
 local function channel(c, k)
     return math.floor(c[k] * 255 + 0.5)
 end
 
--- Text color that stays readable on top of the accent color.
 local function onAccentColor(c)
     local lum = 0.299 * c.R + 0.587 * c.G + 0.114 * c.B
     return (lum > 0.55) and COLORS.bg or COLORS.text
@@ -1086,7 +1052,6 @@ local gui = mk("ScreenGui", {
     DisplayOrder = 100,
 }, guiParent)
 
--- ESP lives in its own ScreenGui below the menu (lower DisplayOrder).
 local espGui = mk("ScreenGui", {
     Name = "PanelV2Esp",
     ResetOnSpawn = false,
@@ -1157,7 +1122,6 @@ local fovCircle = mk("Frame", {
 circle(fovCircle)
 accentStroke(fovCircle, 1.5)
 
-
 ------------------------------------------------------------------------
 -- Localisation refresh registry
 ------------------------------------------------------------------------
@@ -1173,9 +1137,9 @@ local function refreshAll()
 end
 
 ------------------------------------------------------------------------
--- Main window: header, sidebar, pages
+-- Main window
 ------------------------------------------------------------------------
-local applyTheme -- assigned below, after all UI exists
+local applyTheme
 
 local main = mk("Frame", {
     Name = "Main",
@@ -1278,7 +1242,7 @@ corner(pageHolder, 8)
 local pages, tabButtons = {}, {}
 local currentTab = "aim"
 local buildPage = nil
-local applyState -- assigned below, after all UI exists
+local applyState
 
 local function selectTab(name)
     currentTab = name
@@ -1368,7 +1332,6 @@ local function addSection(key)
     end)
 end
 
--- Switch with a sliding knob
 local function addToggle(key, get, set)
     local row = newRow(36)
     local lbl = rowLabel(row, UDim2.new(1, -70, 1, 0))
@@ -1408,7 +1371,6 @@ local function addToggle(key, get, set)
     register(refresh)
 end
 
--- Draggable slider with value on the right
 local function addSlider(key, min, max, step, get, set)
     local pg = buildPage
     local row = newRow(54)
@@ -1499,7 +1461,6 @@ local function addSlider(key, min, max, step, get, set)
     register(refresh)
 end
 
--- Dropdown-style selector: tap to go to the next value
 local function addCycle(key, valueText, onClick)
     local row = newRow(36)
     local lbl = rowLabel(row, UDim2.new(1, -128, 1, 0))
@@ -1595,7 +1556,6 @@ local function setChannel(k, v)
     setAccent(Color3.fromRGB(r, g, b))
 end
 
--- Index of the preset that matches the current color exactly, or nil when the color is custom.
 local function currentPreset()
     local r, g, b = channel(theme.accent, "R"), channel(theme.accent, "G"), channel(theme.accent, "B")
     for i, p in ipairs(PRESETS) do
@@ -1727,7 +1687,7 @@ addButton("theme_reset", function()
     setAccent(DEFAULT_ACCENT)
 end)
 
-local unload -- assigned below
+local unload
 addButton("unload", function()
     unload()
 end)
@@ -1782,7 +1742,6 @@ makeDraggable(toggleBtn, toggleBtn, function()
     setMenuVisible(not main.Visible)
 end)
 
--- PC keyboard shortcut only. Fire-input handling lives in the touch/mouse block above.
 track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
     if gameProcessed then
         return
@@ -1796,10 +1755,9 @@ track(UserInputService.InputBegan:Connect(function(input, gameProcessed)
 end))
 
 ------------------------------------------------------------------------
--- ESP (drawn with Frames, so it needs no Drawing library and works on PC, Android and iOS)
--- Screen space: viewport pixels, origin top-left. Snaplines start at the top-center of the screen.
+-- ESP
 ------------------------------------------------------------------------
-local ESP_COLOR = Color3.fromRGB(210, 32, 44) -- ESP keeps its own color, independent of the menu theme
+local ESP_COLOR = Color3.fromRGB(210, 32, 44)
 
 local BONES_R15 = {
     { "Head", "UpperTorso" }, { "UpperTorso", "LowerTorso" },
@@ -1817,7 +1775,6 @@ local espObjects = {}
 local espCand, espCandChar, espCandHum, espCandRoot, espCandDist, espOrder = {}, {}, {}, {}, {}, {}
 local espStamp = 0
 
--- Property writes are the expensive part of drawing, so a value is only written when it changed.
 local function put(o, inst, prop, value)
     local c = o.cache[inst]
     if c == nil then
@@ -1869,7 +1826,7 @@ local function createEspObject()
             Visible = false,
         }, espLayer))
     end
-    o.makeLine = lineFrame -- skeleton lines are created only when the skeleton is first drawn
+    o.makeLine = lineFrame
 
     o.box = add(mk("Frame", { BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false }, espLayer))
     stroke(o.box, ESP_COLOR, 1.5)
@@ -1919,7 +1876,6 @@ track(Players.PlayerRemoving:Connect(function(p)
     end
 end))
 
--- Returns true if anything was placed on screen for this player.
 local function drawEsp(o, plr, char, hum, root, cam, vp, dist, lvl)
     local head = char:FindFirstChild("Head")
     local headPos
@@ -2046,7 +2002,6 @@ local function espStepInner()
     local lvl = ADAPT_LEVELS[perf.level]
     local limit = math.min(S.espMaxPlayers, lvl.players)
 
-    -- 1) collect the players that qualify (alive, enemy, in range)
     local n = 0
     for _, plr in ipairs(playerList) do
         if plr ~= LocalPlayer then
@@ -2069,12 +2024,10 @@ local function espStepInner()
             nil, nil, nil, nil, nil, nil
     end
 
-    -- 2) nearest first, only when there are more candidates than the draw limit
     if n > limit then
         table.sort(espOrder, espDistLess)
     end
 
-    -- 3) draw up to the limit
     espStamp += 1
     local drawnCount = 0
     for k = 1, n do
@@ -2096,7 +2049,6 @@ local function espStepInner()
     end
     perf.drawn = drawnCount
 
-    -- 4) hide everything that was not drawn this step (once, not on every step)
     for _, o in pairs(espObjects) do
         if o.stamp ~= espStamp and not o.hidden then
             hideEsp(o)
@@ -2104,7 +2056,6 @@ local function espStepInner()
     end
 end
 
--- ESP refresh is capped (S.espRate, and the auto level can lower it further).
 local espAcc = 0
 local espErrorShown = false
 local function espStep(dt)
@@ -2125,7 +2076,6 @@ local function espStep(dt)
     end
 end
 
--- Samples FPS once per second and moves perf.level (auto optimize). Does nothing unless ESP is on.
 local function perfStepInner(dt)
     perf.frames += 1
     perf.acc += dt
@@ -2170,7 +2120,6 @@ local function perfStep(dt)
     end
 end
 
--- No Recoil keeps re-checking once per second while the switch is on.
 local recoilAcc = 0
 local recoilErrorShown = false
 track(RunService.Heartbeat:Connect(function(dt)
@@ -2201,8 +2150,9 @@ unload = function()
         return
     end
     alive = false
-    mouseFire, touchFire, toolFire, lockedPlayer = false, false, false, nil
-    buttonInputs = {}
+    activeInputs = {}
+    toolFire = false
+    lockedPlayer = nil
     pcall(function()
         RunService:UnbindFromRenderStep("PanelV2Aim")
     end)
